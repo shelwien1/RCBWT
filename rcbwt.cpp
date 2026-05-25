@@ -24,15 +24,18 @@ static inline uint64_t mul_u64_u32_hi(uint64_t a, uint32_t b) {
     return (uint64_t)(((__uint128_t)a * b) >> 32);
 }
 
-// Compare cyclic rotations starting at a and b via two chained memcmps.
+// Compare cyclic rotations of inp starting at a and b via chained memcmps
+// on the single input buffer. WLOG lo = min(a,b), hi = max(a,b):
 //
-// WLOG let lo = min(a, b), hi = max(a, b), sign tracking the swap. The
-// first memcmp covers the n - hi bytes where neither side has wrapped.
-// If those are equal, the "hi" side has just wrapped to inp+0 while the
-// "lo" side now sits at lo + (n - hi); the second memcmp finishes the
-// remaining hi bytes, using the doubled buffer dbuf (= inp ++ inp) so
-// the "lo" side stays contiguous across its own wrap.
-static int cmp_cyclic(const uint8_t* inp, const uint8_t* dbuf, size_t n,
+//   memcmp #1:  inp[lo..lo+m1)        vs inp[hi..n)        (m1 = n - hi)
+//                 both sides linear
+//   memcmp #2:  inp[lo+m1..n)         vs inp[0..hi-lo)     (length hi-lo)
+//                 hi-side has wrapped to 0; lo-side still linear
+//   memcmp #3:  inp[0..lo)            vs inp[hi-lo..hi)    (length lo)
+//                 both sides have wrapped
+//
+// Each subsequent memcmp runs only when the previous returned 0.
+static int cmp_cyclic(const uint8_t* inp, size_t n,
                       uint32_t a, uint32_t b) {
     if (a == b) return 0;
     int sign = 1;
@@ -41,7 +44,10 @@ static int cmp_cyclic(const uint8_t* inp, const uint8_t* dbuf, size_t n,
     size_t m1 = n - hi;
     int r = memcmp(inp + lo, inp + hi, m1);
     if (r != 0) return sign * r;
-    r = memcmp(dbuf + lo + m1, inp, hi);
+    size_t m2 = hi - lo;
+    r = memcmp(inp + lo + m1, inp, m2);
+    if (r != 0) return sign * r;
+    r = memcmp(inp, inp + m2, lo);
     return sign * r;
 }
 
@@ -248,13 +254,13 @@ struct KP { uint64_t k; uint32_t p; };
 }
 
 static void sort_and_emit(KP* kp, size_t cnt,
-                          const uint8_t* inp, const uint8_t* dbuf, size_t n,
+                          const uint8_t* inp, size_t n,
                           uint8_t* out, size_t* out_idx, uint32_t* pi) {
     // Sort by (key, then cyclic suffix). The cyclic compare is the safety
     // net for tied keys (truncation-induced or end-of-buffer short keys).
-    std::sort(kp, kp + cnt, [inp, dbuf, n](const KP& a, const KP& b) {
+    std::sort(kp, kp + cnt, [inp, n](const KP& a, const KP& b) {
         if (a.k != b.k) return a.k < b.k;
-        int c = cmp_cyclic(inp, dbuf, n, a.p, b.p);
+        int c = cmp_cyclic(inp, n, a.p, b.p);
         if (c != 0) return c < 0;
         return a.p < b.p;
     });
@@ -269,12 +275,12 @@ static void sort_and_emit(KP* kp, size_t cnt,
 
 static void process_bucket(const uint64_t* bk, const uint32_t* bp, size_t m,
                            uint8_t* out, size_t* out_idx, uint32_t* pi,
-                           const uint8_t* inp, const uint8_t* dbuf, size_t n) {
+                           const uint8_t* inp, size_t n) {
     if (m == 0) return;
     if (m <= K_SLAB_TARGET) {
         KP* kp = (KP*)malloc(m * sizeof(KP));
         for (size_t i = 0; i < m; i++) { kp[i].k = bk[i]; kp[i].p = bp[i]; }
-        sort_and_emit(kp, m, inp, dbuf, n, out, out_idx, pi);
+        sort_and_emit(kp, m, inp, n, out, out_idx, pi);
         free(kp);
         return;
     }
@@ -304,7 +310,7 @@ static void process_bucket(const uint64_t* bk, const uint32_t* bp, size_t m,
             slab[cnt].p = p;
             cnt += (size_t)take;
         }
-        sort_and_emit(slab, cnt, inp, dbuf, n, out, out_idx, pi);
+        sort_and_emit(slab, cnt, inp, n, out, out_idx, pi);
     }
     free(slab);
 }
@@ -334,11 +340,6 @@ static void rcbwt(const uint8_t* inp, size_t n,
     distribute(keys, n, bucket_base, keys_perm, pos_perm);
     free(keys);
 
-    // Doubled input buffer for the cmp_cyclic two-memcmp tail.
-    uint8_t* dbuf = (uint8_t*)malloc(2 * n);
-    memcpy(dbuf,     inp, n);
-    memcpy(dbuf + n, inp, n);
-
     size_t out_idx = 0;
     for (int b = 0; b < 65536; b++) {
         uint32_t lo = bucket_base[b];
@@ -346,10 +347,9 @@ static void rcbwt(const uint8_t* inp, size_t n,
         size_t   m  = hi - lo;
         if (m == 0) continue;
         process_bucket(keys_perm + lo, pos_perm + lo, m,
-                       out, &out_idx, pi, inp, dbuf, n);
+                       out, &out_idx, pi, inp, n);
     }
 
-    free(dbuf);
     free(keys_perm);
     free(pos_perm);
     free(bucket_base);
