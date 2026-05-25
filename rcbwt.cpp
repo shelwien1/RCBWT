@@ -39,6 +39,9 @@ static uint8_t  g_ctx_seen [N_BUCKETS];                // non-empty (q,p) flag
 
 // ---- helpers ------------------------------------------------------------
 
+// Return the high 64 bits of the 96-bit product (a * b). Used in
+// build_code to scale a 64-bit interval span by a 32-bit fixed-point
+// cumulative-probability value (already pre-scaled to 2^32 = 1.0).
 static inline uint64_t mul_u64_u32_hi(uint64_t a, uint32_t b) {
     return (uint64_t)(((__uint128_t)a * b) >> 32);
 }
@@ -72,6 +75,9 @@ static int cmp_cyclic(const uint8_t* inp, size_t n,
 
 // ---- I/O ----------------------------------------------------------------
 
+// Read the whole file at `path` into a freshly-malloced buffer. On success
+// stores the buffer in *buf and returns its byte length; on failure (open,
+// size, read) prints to stderr and returns 0 with *buf left NULL.
 static size_t read_file(const char* path, uint8_t** buf) {
     FILE* f = fopen(path, "rb");
     if (!f) { perror(path); return 0; }
@@ -88,6 +94,9 @@ static size_t read_file(const char* path, uint8_t** buf) {
     return (size_t)sz;
 }
 
+// Write the BWT container at `path`: 4 bytes little-endian primary index
+// pi, then n bytes of BWT body. Returns 0 on success, -1 on any I/O
+// error (after perror to stderr).
 static int write_file(const char* path, uint32_t pi,
                       const uint8_t* bwt, size_t n) {
     FILE* f = fopen(path, "wb");
@@ -118,9 +127,12 @@ static int write_file(const char* path, uint32_t pi,
 static uint32_t* g_pool      = NULL;
 static size_t    g_pool_cap  = 0;
 
+// Convert one CNUM-entry row from raw counts to a cumulative-probability
+// table (in-place, written to row[0..CNUM]). Zero counts get a 1-symbol
+// floor so every symbol has a non-zero interval; the resulting row[c+1]
+// values are scaled to the 2^32 fixed-point grid, with row[CNUM] = 2^32
+// stored as 0 (wraps in uint32).
 static void normalize_row(uint32_t* row) {
-    // row[0..CNUM-1] currently holds raw counts. Replace with cumulative
-    // form (row[0]=0, row[c+1] = normalised cum, row[CNUM] wraps to 0).
     uint32_t flo[CNUM];
     uint64_t total = 0;
     for (int c = 0; c < CNUM; c++) {
@@ -136,6 +148,13 @@ static void normalize_row(uint32_t* row) {
     row[0] = 0;
 }
 
+// Build the static order-1 and order-2 statistical models used by the
+// arithmetic-coded key tail. The order-1 table g_cum1[p][·] is dense
+// (CNUM rows always present). The order-2 table is sparse: g_ctx2_off[ctx]
+// points into g_pool for non-empty contexts only, and lookups fall back
+// to cum1 when a (q,p) context was never observed. Both tables are built
+// from linear positions of inp (no cyclic wrap during counting — model
+// affects key density, not correctness).
 static void build_models(const uint8_t* inp, size_t n) {
     // ---- order-1 model ----
     memset(g_cnt1, 0, sizeof(g_cnt1));
@@ -187,6 +206,11 @@ static void build_models(const uint8_t* inp, size_t n) {
     }
 }
 
+// Look up cum[(q,p)][c] in the order-2 model, falling back to cum1[p][c]
+// when the (q,p) context was never observed (g_ctx2_off[ctx] == 0).
+// c may be CNUM, in which case row[CNUM] = 0 (the wrapped 2^32) makes
+// the subsequent (hi - lo) subtraction yield the correct symbol range
+// modularly.
 static inline uint32_t cum_lookup(uint8_t q, uint8_t p, uint32_t c) {
     uint32_t off = g_ctx2_off[((uint32_t)q << 8) | p];
     if (off) return g_pool[off + c];
@@ -227,6 +251,9 @@ static inline uint64_t build_code(const uint8_t* inp, size_t n, size_t start) {
     return code;
 }
 
+// Build the n composite 64-bit sort keys. Each key packs the rotation
+// starting at j into raw bytes inp[j], inp[(j+1) mod n], followed by the
+// top 48 bits of the order-2 arithmetic code of the cyclic tail.
 static void build_keys(const uint8_t* inp, size_t n, uint64_t* keys) {
     for (size_t j = 0; j < n; j++) {
         uint64_t code = build_code(inp, n, j + 2);
@@ -240,6 +267,10 @@ static void build_keys(const uint8_t* inp, size_t n, uint64_t* keys) {
 
 // ---- distribution pass (top K_TOP_BITS bits) ----------------------------
 
+// One-pass MSD radix on the top K_TOP_BITS of each key. Builds the
+// per-bucket prefix-sum g_bbase[N_BUCKETS+1] and scatters (key, pos)
+// pairs into keys_perm[]/pos_perm[] so bucket b occupies the range
+// [g_bbase[b], g_bbase[b+1]).
 static void distribute(const uint64_t* keys, size_t n,
                        uint64_t* keys_perm, uint32_t* pos_perm) {
     memset(g_bbase, 0, sizeof(g_bbase));
@@ -265,11 +296,14 @@ namespace {
 struct KP { uint64_t k; uint32_t p; };
 }
 
+// Sort one slab (or whole bucket) of (key, pos) pairs and append the
+// corresponding BWT bytes to out[*out_idx..]. The comparator chains
+// key < cmp_cyclic < position so equal keys resolve via full cyclic
+// suffix comparison, and any remaining true-tie group is broken by
+// ascending position (same ordering the dumb path uses, so pi matches).
 static void sort_and_emit(KP* kp, size_t cnt,
                           const uint8_t* inp, size_t n,
                           uint8_t* out, size_t* out_idx, uint32_t* pi) {
-    // Sort by (key, then cyclic suffix). The cyclic compare is the safety
-    // net for tied keys (truncation-induced or end-of-buffer short keys).
     std::sort(kp, kp + cnt, [inp, n](const KP& a, const KP& b) {
         if (a.k != b.k) return a.k < b.k;
         int c = cmp_cyclic(inp, n, a.p, b.p);
@@ -285,6 +319,12 @@ static void sort_and_emit(KP* kp, size_t cnt,
     }
 }
 
+// Sort and emit one distribution-pass bucket of m elements. Sparse
+// buckets (m <= K_SLAB_TARGET) sort directly. Dense buckets are
+// partitioned into S slabs along the K_CODE_BITS code subspace, and each
+// slab is gathered via a branchless stream-compaction pass over the
+// bucket (the `cnt += take` SIMD-friendly kernel from plan §6.2) before
+// being sorted and emitted in ascending slab order.
 static void process_bucket(const uint64_t* bk, const uint32_t* bp, size_t m,
                            uint8_t* out, size_t* out_idx, uint32_t* pi,
                            const uint8_t* inp, size_t n) {
@@ -331,6 +371,10 @@ static void process_bucket(const uint64_t* bk, const uint32_t* bp, size_t m,
 
 // ---- fast driver --------------------------------------------------------
 
+// End-to-end fast path: build models, build composite keys, radix-
+// distribute into N_BUCKETS buckets by raw 2-byte prefix, sort each
+// bucket (with slab partitioning for dense ones), and emit n BWT bytes
+// into out[] plus the primary index into *pi.
 static void rcbwt(const uint8_t* inp, size_t n,
                   uint8_t* out, uint32_t* pi) {
     *pi = 0;
@@ -369,6 +413,11 @@ static void rcbwt(const uint8_t* inp, size_t n,
 
 // ---- reference (std::sort on cyclic rotations) --------------------------
 
+// Brute-force BWT used purely as a test oracle: doubled buffer plus
+// std::sort with memcmp-based cyclic comparator. Same conventions as
+// rcbwt (forward cyclic rotations, BWT[i] = inp[(sa[i]-1+n) mod n], pi
+// records the row where sa[i] == 0); ties are broken by ascending sa[i]
+// to match the fast path.
 static void dumb_bwt(const uint8_t* inp, size_t n,
                      uint8_t* out, uint32_t* pi) {
     *pi = 0;
@@ -430,6 +479,9 @@ static int inverse_bwt(const uint8_t* L, size_t n, uint32_t pi, uint8_t* out) {
 
 // ---- compare & report ---------------------------------------------------
 
+// Compare two BWT outputs (a, b) plus their primary indices and print
+// either "OK" or the first byte-level mismatch with a 32-byte hex
+// surround. Returns 0 if identical, 1 otherwise.
 static int compare_and_report(const uint8_t* a, const uint8_t* b, size_t n,
                               uint32_t pi_a, uint32_t pi_b) {
     int bad = 0;
@@ -458,6 +510,10 @@ static int compare_and_report(const uint8_t* a, const uint8_t* b, size_t n,
 
 // ---- main ---------------------------------------------------------------
 
+// Parse args, run the fast BWT (always) and the dumb BWT (when a third
+// argument is given), write both containers, compare them, and round-
+// trip each through inverse_bwt as a final sanity check. Returns 0 only
+// when every check passed.
 int main(int argc, char** argv) {
     if (argc < 3 || argc > 4) {
         fprintf(stderr, "Usage: %s inputfile outputfile [dumb-BWT-file]\n",
