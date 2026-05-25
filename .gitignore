@@ -2,3 +2,5 @@ rcbwt
 book1out
 book1bwt
 *.o
+BWT
+unBWT
