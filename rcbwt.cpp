@@ -37,6 +37,24 @@ static uint32_t g_cursor   [N_BUCKETS];                // scatter cursors
 static uint32_t g_cnt1     [CNUM * CNUM];              // raw order-1 counts
 static uint8_t  g_ctx_seen [N_BUCKETS];                // non-empty (q,p) flag
 
+// ---- stats counters -----------------------------------------------------
+
+// Per-run counters reset by stats_reset(). cmp_cyclic / memcmp_calls
+// track both the fast and the reference paths since both now share
+// cmp_cyclic on a single input buffer.
+struct Stats {
+    size_t cmp_cyclic_calls;       // cmp_cyclic invocations
+    size_t memcmp_calls;           // raw memcmp calls (1..3 per cmp_cyclic)
+    size_t sort_and_emit_calls;    // each slab or whole bucket = 1 call
+    size_t buckets_nonempty;       // distribution-pass output buckets with m>0
+    size_t slab_passes;            // slab-partition kernel invocations
+    size_t realloc_events;         // slab buffer growths during stream compaction
+    size_t code_iters;             // total build_code inner-loop iterations
+};
+static Stats g_stats;
+
+static void stats_reset() { memset(&g_stats, 0, sizeof(g_stats)); }
+
 // ---- helpers ------------------------------------------------------------
 
 // Return the high 64 bits of the 96-bit product (a * b). Used in
@@ -59,16 +77,20 @@ static inline uint64_t mul_u64_u32_hi(uint64_t a, uint32_t b) {
 // Each subsequent memcmp runs only when the previous returned 0.
 static int cmp_cyclic(const uint8_t* inp, size_t n,
                       uint32_t a, uint32_t b) {
+    g_stats.cmp_cyclic_calls++;
     if (a == b) return 0;
     int sign = 1;
     uint32_t lo = a, hi = b;
     if (lo > hi) { uint32_t t = lo; lo = hi; hi = t; sign = -1; }
     size_t m1 = n - hi;
+    g_stats.memcmp_calls++;
     int r = memcmp(inp + lo, inp + hi, m1);
     if (r != 0) return sign * r;
     size_t m2 = hi - lo;
+    g_stats.memcmp_calls++;
     r = memcmp(inp + lo + m1, inp, m2);
     if (r != 0) return sign * r;
+    g_stats.memcmp_calls++;
     r = memcmp(inp, inp + m2, lo);
     return sign * r;
 }
@@ -234,6 +256,7 @@ static inline uint64_t build_code(const uint8_t* inp, size_t n, size_t start) {
     uint64_t span = ~0ULL;
     size_t k = start;
     while (span >= K_SPAN_FLOOR) {
+        g_stats.code_iters++;
         size_t  kk = (k     < n) ? k     : k - n;
         size_t  k1 = (kk    > 0) ? kk - 1 : n - 1;
         size_t  k2 = (k1    > 0) ? k1 - 1 : n - 1;
@@ -304,6 +327,7 @@ struct KP { uint64_t k; uint32_t p; };
 static void sort_and_emit(KP* kp, size_t cnt,
                           const uint8_t* inp, size_t n,
                           uint8_t* out, size_t* out_idx, uint32_t* pi) {
+    g_stats.sort_and_emit_calls++;
     std::sort(kp, kp + cnt, [inp, n](const KP& a, const KP& b) {
         if (a.k != b.k) return a.k < b.k;
         int c = cmp_cyclic(inp, n, a.p, b.p);
@@ -348,6 +372,7 @@ static void process_bucket(const uint64_t* bk, const uint32_t* bp, size_t m,
     KP* slab = (KP*)malloc(cap * sizeof(KP));
 
     for (size_t s = 0; s < S; s++) {
+        g_stats.slab_passes++;
         uint64_t slab_lo48 = s * w;
         uint64_t slab_hi48 = (s == S - 1) ? K_CODE_RANGE : (s + 1) * w;
         size_t cnt = 0;
@@ -358,6 +383,7 @@ static void process_bucket(const uint64_t* bk, const uint32_t* bp, size_t m,
             int take = (int)((k_low >= slab_lo48) & (k_low < slab_hi48));
             if (cnt + 1 > cap) {
                 cap *= 2;
+                g_stats.realloc_events++;
                 slab = (KP*)realloc(slab, cap * sizeof(KP));
             }
             slab[cnt].k = k;
@@ -401,6 +427,7 @@ static void rcbwt(const uint8_t* inp, size_t n,
         uint32_t hi = g_bbase[b + 1];
         size_t   m  = hi - lo;
         if (m == 0) continue;
+        g_stats.buckets_nonempty++;
         process_bucket(keys_perm + lo, pos_perm + lo, m,
                        out, &out_idx, pi, inp, n);
     }
@@ -413,11 +440,11 @@ static void rcbwt(const uint8_t* inp, size_t n,
 
 // ---- reference (std::sort on cyclic rotations) --------------------------
 
-// Brute-force BWT used purely as a test oracle: doubled buffer plus
-// std::sort with memcmp-based cyclic comparator. Same conventions as
-// rcbwt (forward cyclic rotations, BWT[i] = inp[(sa[i]-1+n) mod n], pi
-// records the row where sa[i] == 0); ties are broken by ascending sa[i]
-// to match the fast path.
+// Brute-force BWT used purely as a test oracle: std::sort on rotation
+// indices with cmp_cyclic as the comparator (no doubled buffer — the
+// three chained memcmps inside cmp_cyclic handle wrap on the single
+// input buffer). Ties on truly-equal cyclic rotations break by ascending
+// sa[i] to match the fast path.
 static void dumb_bwt(const uint8_t* inp, size_t n,
                      uint8_t* out, uint32_t* pi) {
     *pi = 0;
@@ -425,12 +452,8 @@ static void dumb_bwt(const uint8_t* inp, size_t n,
     uint32_t* sa = (uint32_t*)malloc(n * sizeof(uint32_t));
     for (size_t i = 0; i < n; i++) sa[i] = (uint32_t)i;
 
-    uint8_t* d = (uint8_t*)malloc(2 * n);
-    memcpy(d,     inp, n);
-    memcpy(d + n, inp, n);
-
-    std::sort(sa, sa + n, [d, n](uint32_t a, uint32_t b) {
-        int c = memcmp(d + a, d + b, n);
+    std::sort(sa, sa + n, [inp, n](uint32_t a, uint32_t b) {
+        int c = cmp_cyclic(inp, n, a, b);
         if (c != 0) return c < 0;
         return a < b;
     });
@@ -440,7 +463,6 @@ static void dumb_bwt(const uint8_t* inp, size_t n,
         out[i] = (pos == 0) ? inp[n - 1] : inp[pos - 1];
         if (pos == 0) *pi = (uint32_t)i;
     }
-    free(d);
     free(sa);
 }
 
@@ -508,6 +530,61 @@ static int compare_and_report(const uint8_t* a, const uint8_t* b, size_t n,
     return bad;
 }
 
+// ---- stats reporting ----------------------------------------------------
+
+// Print the current algorithm counters under a section heading. Counters
+// are not reset here; callers do that between phases via stats_reset().
+static void print_algo_stats(const char* tag) {
+    printf("[%s] algorithm:\n", tag);
+    printf("  cmp_cyclic calls     : %zu\n", g_stats.cmp_cyclic_calls);
+    printf("  memcmp calls (total) : %zu  (avg %.2f per cmp_cyclic)\n",
+           g_stats.memcmp_calls,
+           g_stats.cmp_cyclic_calls
+               ? (double)g_stats.memcmp_calls / g_stats.cmp_cyclic_calls
+               : 0.0);
+    printf("  sort_and_emit calls  : %zu\n", g_stats.sort_and_emit_calls);
+    printf("  non-empty buckets    : %zu\n", g_stats.buckets_nonempty);
+    printf("  slab partition passes: %zu\n", g_stats.slab_passes);
+    printf("  slab realloc events  : %zu\n", g_stats.realloc_events);
+    printf("  build_code iterations: %zu", g_stats.code_iters);
+    if (g_stats.code_iters) printf("  (key depth metric)");
+    printf("\n");
+}
+
+// Sum and report dynamic and static memory in units of the input size n.
+// `pool_bytes` lets the caller report g_pool's final size (it varies with
+// the number of non-empty order-2 contexts in the input).
+static void print_memory_stats(size_t n, size_t pool_bytes, int with_dumb) {
+    auto pct = [n](size_t bytes) -> double {
+        return n ? (double)bytes / n : 0.0;
+    };
+    size_t fixed = sizeof(g_cum1) + sizeof(g_ctx2_off) + sizeof(g_bbase)
+                 + sizeof(g_cursor) + sizeof(g_cnt1)   + sizeof(g_ctx_seen);
+
+    printf("Memory for n=%zu bytes:\n", n);
+    printf("  inp           = %5.2fn  (%zu B)\n", pct(n),       n);
+    printf("  bwt_out       = %5.2fn  (%zu B)\n", pct(n),       n);
+    printf("  keys          = %5.2fn  (%zu B)\n", pct(8 * n),   8 * n);
+    printf("  keys_perm     = %5.2fn  (%zu B)\n", pct(8 * n),   8 * n);
+    printf("  pos_perm      = %5.2fn  (%zu B)\n", pct(4 * n),   4 * n);
+    printf("  g_pool (ord-2)= %5.3fn  (%zu B)\n", pct(pool_bytes), pool_bytes);
+    if (with_dumb) {
+        printf("  bwt_ref       = %5.2fn  (%zu B)\n", pct(n),     n);
+        printf("  sa (dumb)     = %5.2fn  (%zu B)\n", pct(4 * n), 4 * n);
+        printf("  chk (inverse) = %5.2fn  (%zu B)\n", pct(n),     n);
+        printf("  rank (inverse)= %5.2fn  (%zu B)\n", pct(4 * n), 4 * n);
+    }
+    printf("  static globals= %5.3fn  (%zu B fixed: cum1+ctx2_off+bbase+cursor+cnt1+ctx_seen)\n",
+           pct(fixed), fixed);
+
+    size_t dyn_fast = n + n + 8*n + 8*n + 4*n + pool_bytes;
+    size_t dyn_dumb = with_dumb ? (n + 4*n + n + 4*n) : 0;
+    size_t total    = dyn_fast + dyn_dumb + fixed;
+    printf("  total dynamic = %5.2fn  (fast %zu B + dumb %zu B)\n",
+           pct(dyn_fast + dyn_dumb), dyn_fast, dyn_dumb);
+    printf("  total all     = %5.2fn  (%zu B)\n", pct(total), total);
+}
+
 // ---- main ---------------------------------------------------------------
 
 // Parse args, run the fast BWT (always) and the dumb BWT (when a third
@@ -527,14 +604,19 @@ int main(int argc, char** argv) {
 
     uint8_t* bwt_out = (uint8_t*)malloc(n);
     uint32_t pi = 0;
+    stats_reset();
     rcbwt(inp, n, bwt_out, &pi);
+    print_algo_stats("rcbwt");
+    size_t pool_bytes = g_pool_cap * sizeof(uint32_t);
     if (write_file(argv[2], pi, bwt_out, n) != 0) return 1;
 
     int rc = 0;
     if (argc == 4) {
         uint8_t* bwt_ref = (uint8_t*)malloc(n);
         uint32_t pi_ref = 0;
+        stats_reset();
         dumb_bwt(inp, n, bwt_ref, &pi_ref);
+        print_algo_stats("dumb_bwt");
         if (write_file(argv[3], pi_ref, bwt_ref, n) != 0) return 1;
         rc = compare_and_report(bwt_out, bwt_ref, n, pi, pi_ref);
 
@@ -555,6 +637,8 @@ int main(int argc, char** argv) {
         free(chk);
         free(bwt_ref);
     }
+
+    print_memory_stats(n, pool_bytes, argc == 4);
 
     free(bwt_out);
     free(inp);
