@@ -24,15 +24,31 @@ static inline uint64_t mul_u64_u32_hi(uint64_t a, uint32_t b) {
     return (uint64_t)(((__uint128_t)a * b) >> 32);
 }
 
-// Compare cyclic rotations starting at a and b. <0 if a<b, 0 equal, >0 if a>b.
-static int cmp_cyclic(const uint8_t* inp, size_t n, uint32_t a, uint32_t b) {
+// Compare cyclic rotations of inp starting at a and b via chained memcmps
+// on the single input buffer. WLOG lo = min(a,b), hi = max(a,b):
+//
+//   memcmp #1:  inp[lo..lo+m1)        vs inp[hi..n)        (m1 = n - hi)
+//                 both sides linear
+//   memcmp #2:  inp[lo+m1..n)         vs inp[0..hi-lo)     (length hi-lo)
+//                 hi-side has wrapped to 0; lo-side still linear
+//   memcmp #3:  inp[0..lo)            vs inp[hi-lo..hi)    (length lo)
+//                 both sides have wrapped
+//
+// Each subsequent memcmp runs only when the previous returned 0.
+static int cmp_cyclic(const uint8_t* inp, size_t n,
+                      uint32_t a, uint32_t b) {
     if (a == b) return 0;
-    for (size_t k = 0; k < n; k++) {
-        uint8_t ca = inp[(a + k) % n];
-        uint8_t cb = inp[(b + k) % n];
-        if (ca != cb) return (int)ca - (int)cb;
-    }
-    return 0;
+    int sign = 1;
+    uint32_t lo = a, hi = b;
+    if (lo > hi) { uint32_t t = lo; lo = hi; hi = t; sign = -1; }
+    size_t m1 = n - hi;
+    int r = memcmp(inp + lo, inp + hi, m1);
+    if (r != 0) return sign * r;
+    size_t m2 = hi - lo;
+    r = memcmp(inp + lo + m1, inp, m2);
+    if (r != 0) return sign * r;
+    r = memcmp(inp, inp + m2, lo);
+    return sign * r;
 }
 
 // ---- I/O ----------------------------------------------------------------
