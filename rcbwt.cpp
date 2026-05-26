@@ -81,6 +81,9 @@ struct Stats {
     size_t slab_passes;            // slab-partition kernel invocations
     size_t bucket_fallback;        // buckets sorted via malloc'd big buffer
     size_t code_iters;             // total build_code inner-loop iterations
+    size_t tied_groups;            // runs of equal keys (size > 1) post pass-1
+    size_t tied_items;             // total items in tied groups
+    size_t tied_group_max;         // largest tied group seen
 };
 static Stats g_stats;
 
@@ -410,6 +413,12 @@ static uint32_t g_slab_hist[K_MAX_SLABS];
 // via full cyclic suffix comparison, with any remaining true-tie group
 // broken by ascending position (same ordering the dumb path uses).
 // *out_idx tracks bytes written so we can record pi when pos==0 lands.
+//
+// A 2-stage variant (sort by key only, then sort each tied run via
+// cmp_cyclic) was measured to issue slightly MORE cmp_cyclic calls,
+// because libstdc++'s introsort uses insertion sort for small ranges
+// (~<=16 elements), which costs O(g^2/4) -- fewer than g*log(g) for
+// small g. The composite comparator inherits that benefit.
 static void sort_and_emit(KP* kp, size_t cnt,
                           const uint8_t* inp, size_t n,
                           FILE* fp, size_t* out_idx, uint32_t* pi) {
@@ -420,6 +429,22 @@ static void sort_and_emit(KP* kp, size_t cnt,
         if (c != 0) return c < 0;
         return a.p < b.p;
     });
+
+    // Diagnostic: count tied-key runs in the sorted slab. Pure linear
+    // scan, no further comparisons; surfaces how much of cmp_cyclic's
+    // budget is spent on long equal-key clusters.
+    for (size_t i = 0; i < cnt; ) {
+        size_t j = i + 1;
+        while (j < cnt && kp[j].k == kp[i].k) j++;
+        size_t g = j - i;
+        if (g > 1) {
+            g_stats.tied_groups++;
+            g_stats.tied_items += g;
+            if (g > g_stats.tied_group_max) g_stats.tied_group_max = g;
+        }
+        i = j;
+    }
+
     for (size_t i = 0; i < cnt; i++) {
         uint32_t pos = kp[i].p;
         uint8_t  ch  = (pos == 0) ? inp[n - 1] : inp[pos - 1];
@@ -662,6 +687,13 @@ static void print_algo_stats(const char* tag) {
     printf("  build_code iterations: %zu", g_stats.code_iters);
     if (g_stats.code_iters) printf("  (key depth metric)");
     printf("\n");
+    printf("  tied groups (size>1) : %zu\n", g_stats.tied_groups);
+    printf("  items in tied groups : %zu  (avg %.1f per group, max %zu)\n",
+           g_stats.tied_items,
+           g_stats.tied_groups
+               ? (double)g_stats.tied_items / g_stats.tied_groups
+               : 0.0,
+           g_stats.tied_group_max);
 }
 
 // Sum and report dynamic and static memory in units of the input size n.
