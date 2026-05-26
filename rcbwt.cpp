@@ -25,7 +25,9 @@ static const int K_TOP_BITS = 16;
 static const int N_BUCKETS  = 1 << K_TOP_BITS;         // 65536 = CNUM * CNUM
 
 // Slab-kernel target size (bitonic-sortable in a real SIMD port).
-static const size_t K_SLAB_TARGET = 256;
+static const size_t K_SLAB_TARGET   = 256;
+static const size_t K_SLAB_BUF_SIZE = 2 * K_SLAB_TARGET;    // static slab buffer
+static const size_t K_MAX_SLABS     = 4096;                 // pre-histogram cap
 
 // All compile-time-sized tables live as static globals — no per-call malloc.
 // The fast driver runs at most once per process, so these are not reset between
@@ -48,7 +50,7 @@ struct Stats {
     size_t sort_and_emit_calls;    // each slab or whole bucket = 1 call
     size_t buckets_nonempty;       // distribution-pass output buckets with m>0
     size_t slab_passes;            // slab-partition kernel invocations
-    size_t realloc_events;         // slab buffer growths during stream compaction
+    size_t bucket_fallback;        // buckets sorted via malloc'd big buffer
     size_t code_iters;             // total build_code inner-loop iterations
 };
 static Stats g_stats;
@@ -116,22 +118,46 @@ static size_t read_file(const char* path, uint8_t** buf) {
     return (size_t)sz;
 }
 
-// Write the BWT container at `path`: 4 bytes little-endian primary index
-// pi, then n bytes of BWT body. Returns 0 on success, -1 on any I/O
-// error (after perror to stderr).
+// Write the BWT container at `path`: n bytes of BWT body, then a 4-byte
+// little-endian primary index pi (same layout the rcbwt streaming path
+// produces, and the same layout the standalone BWT.cpp / unBWT.cpp pair
+// uses). Returns 0 on success, -1 on any I/O error.
 static int write_file(const char* path, uint32_t pi,
                       const uint8_t* bwt, size_t n) {
     FILE* f = fopen(path, "wb");
     if (!f) { perror(path); return -1; }
-    uint8_t hdr[4];
-    hdr[0] = (uint8_t)(pi & 0xff);
-    hdr[1] = (uint8_t)((pi >> 8) & 0xff);
-    hdr[2] = (uint8_t)((pi >> 16) & 0xff);
-    hdr[3] = (uint8_t)((pi >> 24) & 0xff);
-    if (fwrite(hdr, 1, 4, f) != 4) { perror("fwrite"); fclose(f); return -1; }
     if (n && fwrite(bwt, 1, n, f) != n) {
         perror("fwrite"); fclose(f); return -1;
     }
+    uint8_t tail[4];
+    tail[0] = (uint8_t)(pi & 0xff);
+    tail[1] = (uint8_t)((pi >> 8) & 0xff);
+    tail[2] = (uint8_t)((pi >> 16) & 0xff);
+    tail[3] = (uint8_t)((pi >> 24) & 0xff);
+    if (fwrite(tail, 1, 4, f) != 4) { perror("fwrite"); fclose(f); return -1; }
+    fclose(f);
+    return 0;
+}
+
+// Read a BWT container produced by write_file / rcbwt: n bytes BWT body
+// followed by a 4-byte LE pi. Caller supplies n; *bwt is malloc'd here.
+// Returns 0 on success.
+static int read_bwt_file(const char* path, size_t n,
+                         uint8_t** bwt, uint32_t* pi) {
+    FILE* f = fopen(path, "rb");
+    if (!f) { perror(path); return -1; }
+    *bwt = (uint8_t*)malloc(n);
+    if (n && fread(*bwt, 1, n, f) != n) {
+        perror("fread bwt"); fclose(f); free(*bwt); *bwt = NULL; return -1;
+    }
+    uint8_t tail[4];
+    if (fread(tail, 1, 4, f) != 4) {
+        perror("fread pi"); fclose(f); free(*bwt); *bwt = NULL; return -1;
+    }
+    *pi = (uint32_t)tail[0]
+        | ((uint32_t)tail[1] <<  8)
+        | ((uint32_t)tail[2] << 16)
+        | ((uint32_t)tail[3] << 24);
     fclose(f);
     return 0;
 }
@@ -315,18 +341,23 @@ static void distribute(const uint64_t* keys, size_t n,
 
 // ---- slab sort + tie resolution + emission ------------------------------
 
-namespace {
+// One (key, position) pair under sort. `p` is the input position whose
+// rotation the key represents.
 struct KP { uint64_t k; uint32_t p; };
-}
 
-// Sort one slab (or whole bucket) of (key, pos) pairs and append the
-// corresponding BWT bytes to out[*out_idx..]. The comparator chains
-// key < cmp_cyclic < position so equal keys resolve via full cyclic
-// suffix comparison, and any remaining true-tie group is broken by
-// ascending position (same ordering the dumb path uses, so pi matches).
+// Static slab and pre-histogram tables (no per-call malloc).
+static KP       g_slab     [K_SLAB_BUF_SIZE];
+static uint32_t g_slab_hist[K_MAX_SLABS];
+
+// Sort one slab (or whole bucket) of (key, pos) pairs and stream the
+// corresponding BWT bytes directly to `fp` (no in-memory output buffer).
+// The comparator chains key < cmp_cyclic < position so equal keys resolve
+// via full cyclic suffix comparison, with any remaining true-tie group
+// broken by ascending position (same ordering the dumb path uses).
+// *out_idx tracks bytes written so we can record pi when pos==0 lands.
 static void sort_and_emit(KP* kp, size_t cnt,
                           const uint8_t* inp, size_t n,
-                          uint8_t* out, size_t* out_idx, uint32_t* pi) {
+                          FILE* fp, size_t* out_idx, uint32_t* pi) {
     g_stats.sort_and_emit_calls++;
     std::sort(kp, kp + cnt, [inp, n](const KP& a, const KP& b) {
         if (a.k != b.k) return a.k < b.k;
@@ -337,40 +368,64 @@ static void sort_and_emit(KP* kp, size_t cnt,
     for (size_t i = 0; i < cnt; i++) {
         uint32_t pos = kp[i].p;
         uint8_t  ch  = (pos == 0) ? inp[n - 1] : inp[pos - 1];
-        out[*out_idx] = ch;
+        fputc(ch, fp);
         if (pos == 0) *pi = (uint32_t)(*out_idx);
         (*out_idx)++;
     }
 }
 
-// Sort and emit one distribution-pass bucket of m elements. Sparse
-// buckets (m <= K_SLAB_TARGET) sort directly. Dense buckets are
-// partitioned into S slabs along the K_CODE_BITS code subspace, and each
-// slab is gathered via a branchless stream-compaction pass over the
-// bucket (the `cnt += take` SIMD-friendly kernel from plan §6.2) before
-// being sorted and emitted in ascending slab order.
+// Sort and emit one distribution-pass bucket of m elements directly to
+// `fp`. Three paths:
+//   small bucket  (m <= K_SLAB_BUF_SIZE)  — fits in g_slab, sort & emit
+//   dense bucket  (slab partition fits)   — pre-histogram per-slab
+//                                           sizes, then stream-compact
+//                                           each slab into g_slab
+//   overflow      (any slab > buffer, or
+//                  S > K_MAX_SLABS)        — malloc once for the whole
+//                                           bucket and sort it as one
+//                                           block (fall-back path)
 static void process_bucket(const uint64_t* bk, const uint32_t* bp, size_t m,
-                           uint8_t* out, size_t* out_idx, uint32_t* pi,
+                           FILE* fp, size_t* out_idx, uint32_t* pi,
                            const uint8_t* inp, size_t n) {
     if (m == 0) return;
-    if (m <= K_SLAB_TARGET) {
-        KP* kp = (KP*)malloc(m * sizeof(KP));
-        for (size_t i = 0; i < m; i++) { kp[i].k = bk[i]; kp[i].p = bp[i]; }
-        sort_and_emit(kp, m, inp, n, out, out_idx, pi);
-        free(kp);
+
+    // ---- small bucket: fits in static buffer --------------------------
+    if (m <= K_SLAB_BUF_SIZE) {
+        for (size_t i = 0; i < m; i++) { g_slab[i].k = bk[i]; g_slab[i].p = bp[i]; }
+        sort_and_emit(g_slab, m, inp, n, fp, out_idx, pi);
         return;
     }
-    // ---- slab partition over the K_CODE_BITS code subspace ------------
+
     const uint64_t K_CODE_RANGE = 1ULL << K_CODE_BITS;
     const uint64_t K_CODE_MASK  = K_CODE_RANGE - 1;
     size_t S = (m + K_SLAB_TARGET - 1) / K_SLAB_TARGET;
     uint64_t w = K_CODE_RANGE / S;
     if (w == 0) w = 1;
 
-    size_t cap = 2 * K_SLAB_TARGET + 64;
-    if (cap < m + 64) cap = m + 64;
-    KP* slab = (KP*)malloc(cap * sizeof(KP));
+    // ---- pre-histogram or whole-bucket fall-back ----------------------
+    bool fallback = (S > K_MAX_SLABS);
+    if (!fallback) {
+        memset(g_slab_hist, 0, S * sizeof(uint32_t));
+        for (size_t i = 0; i < m; i++) {
+            uint64_t k_low = bk[i] & K_CODE_MASK;
+            size_t s = (size_t)(k_low / w);
+            if (s >= S) s = S - 1;
+            g_slab_hist[s]++;
+        }
+        for (size_t s = 0; s < S; s++) {
+            if (g_slab_hist[s] > K_SLAB_BUF_SIZE) { fallback = true; break; }
+        }
+    }
+    if (fallback) {
+        g_stats.bucket_fallback++;
+        KP* big = (KP*)malloc(m * sizeof(KP));
+        for (size_t i = 0; i < m; i++) { big[i].k = bk[i]; big[i].p = bp[i]; }
+        sort_and_emit(big, m, inp, n, fp, out_idx, pi);
+        free(big);
+        return;
+    }
 
+    // ---- slab partition with static buffer ----------------------------
     for (size_t s = 0; s < S; s++) {
         g_stats.slab_passes++;
         uint64_t slab_lo48 = s * w;
@@ -381,33 +436,35 @@ static void process_bucket(const uint64_t* bk, const uint32_t* bp, size_t m,
             uint32_t p     = bp[i];
             uint64_t k_low = k & K_CODE_MASK;
             int take = (int)((k_low >= slab_lo48) & (k_low < slab_hi48));
-            if (cnt + 1 > cap) {
-                cap *= 2;
-                g_stats.realloc_events++;
-                slab = (KP*)realloc(slab, cap * sizeof(KP));
-            }
-            slab[cnt].k = k;
-            slab[cnt].p = p;
+            g_slab[cnt].k = k;
+            g_slab[cnt].p = p;
             cnt += (size_t)take;
         }
-        sort_and_emit(slab, cnt, inp, n, out, out_idx, pi);
+        sort_and_emit(g_slab, cnt, inp, n, fp, out_idx, pi);
     }
-    free(slab);
 }
 
 // ---- fast driver --------------------------------------------------------
 
+// Append a 4-byte little-endian uint32 to fp.
+static int write_u32_le(FILE* fp, uint32_t v) {
+    uint8_t b[4] = {
+        (uint8_t)(v & 0xff), (uint8_t)((v >> 8) & 0xff),
+        (uint8_t)((v >> 16) & 0xff), (uint8_t)((v >> 24) & 0xff)
+    };
+    return (fwrite(b, 1, 4, fp) == 4) ? 0 : -1;
+}
+
 // End-to-end fast path: build models, build composite keys, radix-
-// distribute into N_BUCKETS buckets by raw 2-byte prefix, sort each
-// bucket (with slab partitioning for dense ones), and emit n BWT bytes
-// into out[] plus the primary index into *pi.
-static void rcbwt(const uint8_t* inp, size_t n,
-                  uint8_t* out, uint32_t* pi) {
-    *pi = 0;
-    if (n == 0) return;
+// distribute into N_BUCKETS buckets, then walk buckets in ascending
+// order, sort each (slab-partitioning dense ones), and stream the BWT
+// bytes directly to `fp`. After all n bytes are emitted, a 4-byte LE
+// primary index is appended — final file layout is [n BWT bytes][pi].
+static void rcbwt(const uint8_t* inp, size_t n, FILE* fp) {
+    if (n == 0) { write_u32_le(fp, 0); return; }
     if (n == 1) {
-        out[0] = inp[0];
-        *pi = 0;
+        fputc(inp[0], fp);
+        write_u32_le(fp, 0);
         return;
     }
 
@@ -422,6 +479,7 @@ static void rcbwt(const uint8_t* inp, size_t n,
     free(keys);
 
     size_t out_idx = 0;
+    uint32_t pi    = 0;
     for (int b = 0; b < N_BUCKETS; b++) {
         uint32_t lo = g_bbase[b];
         uint32_t hi = g_bbase[b + 1];
@@ -429,8 +487,9 @@ static void rcbwt(const uint8_t* inp, size_t n,
         if (m == 0) continue;
         g_stats.buckets_nonempty++;
         process_bucket(keys_perm + lo, pos_perm + lo, m,
-                       out, &out_idx, pi, inp, n);
+                       fp, &out_idx, &pi, inp, n);
     }
+    write_u32_le(fp, pi);
 
     free(keys_perm);
     free(pos_perm);
@@ -545,7 +604,7 @@ static void print_algo_stats(const char* tag) {
     printf("  sort_and_emit calls  : %zu\n", g_stats.sort_and_emit_calls);
     printf("  non-empty buckets    : %zu\n", g_stats.buckets_nonempty);
     printf("  slab partition passes: %zu\n", g_stats.slab_passes);
-    printf("  slab realloc events  : %zu\n", g_stats.realloc_events);
+    printf("  bucket-overflow falls: %zu\n", g_stats.bucket_fallback);
     printf("  build_code iterations: %zu", g_stats.code_iters);
     if (g_stats.code_iters) printf("  (key depth metric)");
     printf("\n");
@@ -554,31 +613,37 @@ static void print_algo_stats(const char* tag) {
 // Sum and report dynamic and static memory in units of the input size n.
 // `pool_bytes` lets the caller report g_pool's final size (it varies with
 // the number of non-empty order-2 contexts in the input).
-static void print_memory_stats(size_t n, size_t pool_bytes, int with_dumb) {
+static void print_memory_stats(size_t n, size_t pool_bytes,
+                               size_t fast_bwt_readback_bytes,
+                               int with_dumb) {
     auto pct = [n](size_t bytes) -> double {
         return n ? (double)bytes / n : 0.0;
     };
     size_t fixed = sizeof(g_cum1) + sizeof(g_ctx2_off) + sizeof(g_bbase)
-                 + sizeof(g_cursor) + sizeof(g_cnt1)   + sizeof(g_ctx_seen);
+                 + sizeof(g_cursor) + sizeof(g_cnt1)   + sizeof(g_ctx_seen)
+                 + sizeof(g_slab)  + sizeof(g_slab_hist);
 
     printf("Memory for n=%zu bytes:\n", n);
     printf("  inp           = %5.2fn  (%zu B)\n", pct(n),       n);
-    printf("  bwt_out       = %5.2fn  (%zu B)\n", pct(n),       n);
     printf("  keys          = %5.2fn  (%zu B)\n", pct(8 * n),   8 * n);
     printf("  keys_perm     = %5.2fn  (%zu B)\n", pct(8 * n),   8 * n);
     printf("  pos_perm      = %5.2fn  (%zu B)\n", pct(4 * n),   4 * n);
     printf("  g_pool (ord-2)= %5.3fn  (%zu B)\n", pct(pool_bytes), pool_bytes);
     if (with_dumb) {
+        printf("  bwt_fast read = %5.2fn  (%zu B, verification only)\n",
+               pct(fast_bwt_readback_bytes), fast_bwt_readback_bytes);
         printf("  bwt_ref       = %5.2fn  (%zu B)\n", pct(n),     n);
         printf("  sa (dumb)     = %5.2fn  (%zu B)\n", pct(4 * n), 4 * n);
         printf("  chk (inverse) = %5.2fn  (%zu B)\n", pct(n),     n);
         printf("  rank (inverse)= %5.2fn  (%zu B)\n", pct(4 * n), 4 * n);
     }
-    printf("  static globals= %5.3fn  (%zu B fixed: cum1+ctx2_off+bbase+cursor+cnt1+ctx_seen)\n",
+    printf("  static globals= %5.3fn  (%zu B fixed: cum1+ctx2_off+bbase+cursor+cnt1+ctx_seen+slab+slab_hist)\n",
            pct(fixed), fixed);
 
-    size_t dyn_fast = n + n + 8*n + 8*n + 4*n + pool_bytes;
-    size_t dyn_dumb = with_dumb ? (n + 4*n + n + 4*n) : 0;
+    size_t dyn_fast = n + 8*n + 8*n + 4*n + pool_bytes;          // no bwt_out
+    size_t dyn_dumb = with_dumb
+        ? (fast_bwt_readback_bytes + n + 4*n + n + 4*n)
+        : 0;
     size_t total    = dyn_fast + dyn_dumb + fixed;
     printf("  total dynamic = %5.2fn  (fast %zu B + dumb %zu B)\n",
            pct(dyn_fast + dyn_dumb), dyn_fast, dyn_dumb);
@@ -602,25 +667,33 @@ int main(int argc, char** argv) {
     size_t n = read_file(argv[1], &inp);
     if (n == 0) { fprintf(stderr, "empty input\n"); return 1; }
 
-    uint8_t* bwt_out = (uint8_t*)malloc(n);
-    uint32_t pi = 0;
+    // ---- fast path: stream directly to argv[2] ------------------------
+    FILE* fp_fast = fopen(argv[2], "wb");
+    if (!fp_fast) { perror(argv[2]); return 1; }
     stats_reset();
-    rcbwt(inp, n, bwt_out, &pi);
+    rcbwt(inp, n, fp_fast);
+    fclose(fp_fast);
     print_algo_stats("rcbwt");
     size_t pool_bytes = g_pool_cap * sizeof(uint32_t);
-    if (write_file(argv[2], pi, bwt_out, n) != 0) return 1;
 
     int rc = 0;
     if (argc == 4) {
+        // ---- reference path in memory, then file --------------------
         uint8_t* bwt_ref = (uint8_t*)malloc(n);
         uint32_t pi_ref = 0;
         stats_reset();
         dumb_bwt(inp, n, bwt_ref, &pi_ref);
         print_algo_stats("dumb_bwt");
         if (write_file(argv[3], pi_ref, bwt_ref, n) != 0) return 1;
-        rc = compare_and_report(bwt_out, bwt_ref, n, pi, pi_ref);
 
-        // Cross-check both BWTs by inverting them and matching the input.
+        // Read fast output back from disk for compare + inverse.
+        uint8_t*  bwt_fast = NULL;
+        uint32_t  pi_fast  = 0;
+        if (read_bwt_file(argv[2], n, &bwt_fast, &pi_fast) != 0) return 1;
+
+        rc = compare_and_report(bwt_fast, bwt_ref, n, pi_fast, pi_ref);
+
+        // Cross-check both BWTs by inverting and matching the input.
         uint8_t* chk = (uint8_t*)malloc(n);
         inverse_bwt(bwt_ref, n, pi_ref, chk);
         if (memcmp(chk, inp, n) != 0) {
@@ -628,19 +701,19 @@ int main(int argc, char** argv) {
         } else {
             printf("dumb_bwt inverse: ok\n");
         }
-        inverse_bwt(bwt_out, n, pi, chk);
+        inverse_bwt(bwt_fast, n, pi_fast, chk);
         if (memcmp(chk, inp, n) != 0) {
             printf("rcbwt inverse: MISMATCH\n"); rc = 1;
         } else {
             printf("rcbwt inverse: ok\n");
         }
         free(chk);
+        free(bwt_fast);
         free(bwt_ref);
     }
 
-    print_memory_stats(n, pool_bytes, argc == 4);
+    print_memory_stats(n, pool_bytes, argc == 4 ? n : 0, argc == 4);
 
-    free(bwt_out);
     free(inp);
     return rc;
 }
