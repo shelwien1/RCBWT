@@ -1,25 +1,12 @@
-// rcbwt2: rcbwt + two-pass backward recurrence in build_keys.
-// Usage: rcbwt2 inputfile outputfile [dumb-BWT-file]
+// rcbwt: BWT via entropy-coded suffix keys (see RC_BWT.md, plan.md).
+// Usage: rcbwt inputfile outputfile [dumb-BWT-file]
 //
 // Output format (both fast and reference paths):
 //   [ 4 bytes LE primary index pi ][ n bytes BWT ]
 //
-// Difference from rcbwt: build_keys() no longer calls build_code at all.
-// Only keys[n-1] is seeded (single 64-bit write — no full-array memset).
-//
-// Pass 1 (write-only) walks j = n-2..0 computing keys[j] from keys[j+1]
-// in a strictly non-cyclic order. Pass 2 walks j = n-1..0 refining
-// keys[n-1] (which still carries the seed) and the immediate neighbours
-// affected by the seed; it exits the moment a key matches its previous
-// value, since the recurrence is deterministic in the neighbour and any
-// later key would then also be unchanged. The shared body is a template
-// parameterized on whether to compare and exit early.
-//
-//      code[j] = mul_hi(~0, lo) + mul_hi(keys[(j+1)%n] << 16, r)
-//
-// On book1 this converges in ~n+6 inner steps (vs ~6-7n for rcbwt's
-// per-position build_code, and 3n for the previous full-pass variant).
-// BWT and pi remain byte-identical to rcbwt and the dumb-BWT oracle.
+// The fast path implements the streaming radix on a 64-bit composite key:
+// 16 raw context bits + 48 bits of an order-2 arithmetic-coded tail.
+// The reference (dumb) path uses std::sort on cyclic rotations.
 
 #include <algorithm>
 #include <cstdint>
@@ -232,83 +219,52 @@ static inline uint32_t cum_lookup(uint8_t q, uint8_t p, uint32_t c) {
     return g_cum2[(((uint32_t)q << 8) | p) * CNUM1 + c];
 }
 
+// Code-build precision floor: stop the arithmetic-code loop once span
+// drops below this. Below this point the (span * r) >> 32 multiply
+// underflows to near-zero and contributes no information.
+static const uint64_t K_SPAN_FLOOR = 1ULL << 16;
+
 // Bit layout of the 64-bit composite sort key.
 static const int K_PREFIX_BITS = 16;                          // 2 raw symbols
 static const int K_CODE_BITS   = 64 - K_PREFIX_BITS;          // 48
 
-// Safety cap for the refining pass — in practice convergence happens
-// inside the first call (early-exit at depth ~6 below n-1).
-static const int K_MAX_REFINE_PASSES = 16;
-
-// Walk j = start_j..0 once, applying the prepend recurrence
-//
-//   code[j] = mul_hi(~0, lo) + mul_hi(keys[(j+1)%n] << 16, r)
-//
-// and re-stamping the raw prefix bytes into the top 16 bits of keys[j].
-// When TRACK is true, the function exits the moment a recomputed key
-// matches the stored one: the recurrence is deterministic in keys[jp1],
-// so once keys[j] is unchanged from the previous pass, every key for
-// j' < j will be unchanged too. Returns true on early exit (converged),
-// false if the walk ran to completion.
-template <bool TRACK>
-static bool refine_pass(const uint8_t* inp, size_t n,
-                        uint64_t* keys, size_t start_j) {
-    for (size_t j_inv = 0; j_inv <= start_j; j_inv++) {
-        size_t j   = start_j - j_inv;
-        size_t jp1 = (j   + 1 < n) ? j   + 1 : 0;
-        size_t jp2 = (jp1 + 1 < n) ? jp1 + 1 : 0;
-
-        uint8_t q = inp[j];
-        uint8_t p = inp[jp1];
-        uint8_t c = inp[jp2];
+// Build a 64-bit arithmetic code from inp[start..], wrapping cyclically.
+// Cyclic wrap makes the key a function of the entire rotation, which
+// preserves order across positions of different effective "tail length".
+static inline uint64_t build_code(const uint8_t* inp, size_t n, size_t start) {
+    uint64_t code = 0;
+    uint64_t span = ~0ULL;
+    size_t k = start;
+    while (span >= K_SPAN_FLOOR) {
+        g_stats.code_iters++;
+        size_t  kk = (k     < n) ? k     : k - n;
+        size_t  k1 = (kk    > 0) ? kk - 1 : n - 1;
+        size_t  k2 = (k1    > 0) ? k1 - 1 : n - 1;
+        uint8_t c = inp[kk];
+        uint8_t p = inp[k1];
+        uint8_t q = inp[k2];
         uint32_t lo = cum_lookup(q, p, c);
         uint32_t hi = cum_lookup(q, p, (uint32_t)c + 1);
-        uint32_t r  = hi - lo;
-
-        // keys[jp1] << K_PREFIX_BITS shifts the raw prefix out the top
-        // and zero-fills the bottom 16 bits, giving the 48-bit code as
-        // the high 48 bits of a 64-bit value.
-        uint64_t tail = keys[jp1] << K_PREFIX_BITS;
-        uint64_t code = mul_u64_u32_hi(~0ULL, lo)
-                      + mul_u64_u32_hi(tail, r);
-        g_stats.code_iters++;
-
-        uint64_t new_key = ((uint64_t)q << (K_CODE_BITS + 8))
-                         | ((uint64_t)p <<  K_CODE_BITS)
-                         | (code >> K_PREFIX_BITS);
-
-        if constexpr (TRACK) {
-            if (keys[j] == new_key) return true;
-        }
-        keys[j] = new_key;
+        uint32_t r  = hi - lo;             // modular: r = 2^32 when c=CNUM-1
+        code += mul_u64_u32_hi(span, lo);
+        span  = mul_u64_u32_hi(span, r);
+        k++;
+        if (k >= 2 * n) k -= n;            // keep k bounded
     }
-    return false;
+    return code;
 }
 
-// Build the n composite 64-bit sort keys without ever calling
-// build_code or zero-initializing the whole keys[] array.
-//
-//   - Seed: a single 64-bit write to keys[n-1]. Pass 1 reads it via
-//     `keys[n-1] << K_PREFIX_BITS`, so any value whose low 48 bits are
-//     zero gives a clean zero tail; we just store 0.
-//   - Pass 1 (TRACK=false): write every key once, in strict order
-//     j = n-2..0. No cyclic wrap on j+1, no comparisons.
-//   - Pass 2 (TRACK=true) and beyond: walk j = n-1..0, exit on the
-//     first key that already matches. Saturation past the precision
-//     floor (~6 prepends) makes pass 2 stop near j = n-7.
+// Build the n composite 64-bit sort keys. Each key packs the rotation
+// starting at j into raw bytes inp[j], inp[(j+1) mod n], followed by the
+// top 48 bits of the order-2 arithmetic code of the cyclic tail.
 static void build_keys(const uint8_t* inp, size_t n, uint64_t* keys) {
-    if (n == 0) return;
-    if (n == 1) {
-        uint8_t b = inp[0];
-        keys[0] = ((uint64_t)b << (K_CODE_BITS + 8))
-                | ((uint64_t)b <<  K_CODE_BITS);
-        return;
-    }
-
-    keys[n - 1] = 0;
-    refine_pass<false>(inp, n, keys, n - 2);
-    for (int pass = 0; pass < K_MAX_REFINE_PASSES; pass++) {
-        if (refine_pass<true>(inp, n, keys, n - 1)) break;
+    for (size_t j = 0; j < n; j++) {
+        uint64_t code = build_code(inp, n, j + 2);
+        uint8_t  b0 = inp[j];
+        uint8_t  b1 = inp[(j + 1) % n];
+        keys[j] = ((uint64_t)b0 << (K_CODE_BITS + 8))
+                | ((uint64_t)b1 <<  K_CODE_BITS)
+                | (code >> K_PREFIX_BITS);
     }
 }
 
