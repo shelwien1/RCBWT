@@ -3,27 +3,26 @@
 //
 // Output format: [ n bytes BWT ][ 4 bytes LE primary index pi ]
 //
-// Each cyclic rotation gets a 64-bit sort key = the order-2 AC code of
-// its cyclic tail starting at inp[(j+2) mod n], built by the two-pass
-// refine recurrence (pass 1 write-only, pass 2 TRACK=true with
-// early-exit on first matching key). build_keys() leaves keys as raw
-// 64-bit codes; cross-prefix lex order is restored by the MSD radix in
-// distribute(), which bucketizes on the raw 2-byte prefix
-// (inp[j], inp[(j+1)%n]).
+// Each composite key is the full 64-bit arithmetic-code value of the
+// entire cyclic rotation starting at j, encoded as
 //
-// Within each bucket all positions share (q,p) and the order-2 AC tail
-// codes preserve the lex order of the remaining cyclic rotation by
-// monotonicity. process_bucket slab-partitions over the full 64-bit
-// key value. sort_and_emit runs two cleanly separated passes per
-// slab: pass 1 sorts by key only (pure integer compare, no inp
-// loads); pass 2 walks runs of equal keys and sorts each by
-// cmp_cyclic + position only -- no redundant key compares in the hot
-// tie-break loop.
+//     AC(order-0 of inp[j])
+//       . AC(order-1 of inp[(j+1)%n] | inp[j])
+//         . AC(order-2 of inp[(j+2)%n], inp[(j+3)%n], ... cyclically)
 //
-// The order-0 and order-1 cum tables (g_cum0, g_cum1) and the
-// per-(q,p) prefix interval table (g_prefix_lo/r) are still built and
-// retained for instrumentation / future variants but are no longer
-// used to wrap keys.
+// build_keys() runs the two-pass refine recurrence (pass 1 write-only,
+// pass 2 with TRACK = early-exit on first matching key) to fill keys[]
+// with the 64-bit order-2 tail codes, then a final O(N) loop scales
+// each tail into its 2-byte prefix interval — precomputed in
+// g_prefix_lo / g_prefix_r for every (q,p) pair from the order-0 and
+// order-1 cum tables.
+//
+// The MSD radix in distribute() now reads the top 16 bits of these
+// fully entropy-coded keys, so bucket sizes track AC probabilities of
+// the 2-byte prefix instead of raw (q,p) frequencies — buckets are
+// entropy-balanced and the within-bucket tail bits carry roughly 12
+// bytes of distinguishing context instead of the ~6 bytes the
+// previous raw-prefix+48-bit-code layout exposed.
 
 #include <algorithm>
 #include <cmath>
@@ -38,8 +37,7 @@
 static const int CNUM    = 256;
 static const int CNUM1   = CNUM + 1;                   // cum-table entries per row
 
-// MSD radix on the 16-bit raw 2-byte prefix of each cyclic rotation;
-// 65536 buckets, one per (inp[i], inp[(i+1) mod n]) pair.
+// MSD radix on the top K_TOP_BITS of the composite key.
 static const int K_TOP_BITS = 16;
 static const int N_BUCKETS  = 1 << K_TOP_BITS;         // 65536 = CNUM * CNUM
 
@@ -313,10 +311,15 @@ static double compute_order2_bpb(const uint8_t* inp, size_t n) {
     return total_bits / (double)(n - 2);
 }
 
-// The sort key is the full 64-bit order-2 AC code of the cyclic tail.
-// The radix bucket index is computed separately from raw (inp[j],
-// inp[(j+1)%n]) in distribute(), so no bit of the key is consumed by
-// the bucket — within a bucket the slab partition gets all 64 bits.
+// Bit layout of the 64-bit composite sort key: the top K_TOP_BITS feed
+// the MSD radix; the bottom K_CODE_BITS feed the slab partition. With
+// keys now being full AC encodings, "top" carries the order-0+order-1
+// prefix and "bottom" carries the order-2 tail residue inside that
+// prefix interval.
+static const int K_CODE_BITS = 64 - K_TOP_BITS;          // 48
+
+// Safety cap for the refining pass — in practice convergence happens
+// inside the first call (early-exit a few prepends past n-1).
 static const int K_MAX_REFINE_PASSES = 16;
 
 // Walk j = start_j..0 once, applying the order-2 prepend recurrence on
@@ -364,12 +367,9 @@ static bool refine_pass(const uint8_t* inp, size_t n,
 //      holds the 64-bit order-2 AC code of the cyclic tail starting
 //      at inp[(j+2) mod n].
 //
-//   2. (Disabled experiment) Wrap: scale each tail into its 2-byte
-//      prefix interval. Disabling keeps keys as raw 64-bit tail
-//      codes; distribute() restores cross-prefix order by bucketing
-//      on raw (q,p) bytes, and within a bucket all keys share (q,p)
-//      so the tail codes themselves preserve lex order of the
-//      remaining cyclic rotation.
+//   2. Wrap: scale each tail into its 2-byte prefix interval using
+//      the precomputed g_prefix_lo / g_prefix_r tables, turning each
+//      key into the full AC encoding of the entire cyclic rotation.
 static void build_keys(const uint8_t* inp, size_t n, uint64_t* keys) {
     if (n == 0) return;
     if (n == 1) { keys[0] = 0; return; }
@@ -380,28 +380,25 @@ static void build_keys(const uint8_t* inp, size_t n, uint64_t* keys) {
         if (refine_pass<true>(inp, n, keys, n - 1)) break;
     }
 
-    // for (size_t j = 0; j < n; j++) {
-    //     size_t jp1 = (j + 1 < n) ? j + 1 : 0;
-    //     size_t idx = (size_t)inp[j] * CNUM + inp[jp1];
-    //     keys[j] = g_prefix_lo[idx]
-    //             + mul_u64_u64_hi(keys[j], g_prefix_r[idx]);
-    // }
+    for (size_t j = 0; j < n; j++) {
+        size_t jp1 = (j + 1 < n) ? j + 1 : 0;
+        size_t idx = (size_t)inp[j] * CNUM + inp[jp1];
+        keys[j] = g_prefix_lo[idx]
+                + mul_u64_u64_hi(keys[j], g_prefix_r[idx]);
+    }
 }
 
-// ---- distribution pass (raw 2-byte prefix radix) ------------------------
+// ---- distribution pass (top K_TOP_BITS bits) ----------------------------
 
-// One-pass MSD radix using the raw 2-byte prefix (inp[i], inp[(i+1)%n])
-// as the bucket index. With the prefix-wrap loop in build_keys disabled,
-// the keys[] are full 64-bit order-2 tail codes; the bucket index has to
-// come from inp[] directly to restore cross-prefix lex order. Within each
-// bucket all positions share (q,p) and the 64-bit tail codes carry the
-// order of the remaining cyclic rotation.
-static void distribute(const uint8_t* inp, const uint64_t* keys, size_t n,
+// One-pass MSD radix on the top K_TOP_BITS of each key. Builds the
+// per-bucket prefix-sum g_bbase[N_BUCKETS+1] and scatters (key, pos)
+// pairs into keys_perm[]/pos_perm[] so bucket b occupies the range
+// [g_bbase[b], g_bbase[b+1]).
+static void distribute(const uint64_t* keys, size_t n,
                        uint64_t* keys_perm, uint32_t* pos_perm) {
     memset(g_bbase, 0, sizeof(g_bbase));
     for (size_t i = 0; i < n; i++) {
-        size_t ip1 = (i + 1 < n) ? i + 1 : 0;
-        uint32_t b = ((uint32_t)inp[i] << 8) | inp[ip1];
+        uint32_t b = (uint32_t)(keys[i] >> K_CODE_BITS);
         g_bbase[b + 1]++;
     }
     for (int b = 1; b <= N_BUCKETS; b++) {
@@ -409,8 +406,7 @@ static void distribute(const uint8_t* inp, const uint64_t* keys, size_t n,
     }
     memcpy(g_cursor, g_bbase, sizeof(g_cursor));
     for (size_t i = 0; i < n; i++) {
-        size_t ip1 = (i + 1 < n) ? i + 1 : 0;
-        uint32_t b = ((uint32_t)inp[i] << 8) | inp[ip1];
+        uint32_t b = (uint32_t)(keys[i] >> K_CODE_BITS);
         uint32_t dst = g_cursor[b]++;
         keys_perm[dst] = keys[i];
         pos_perm[dst] = (uint32_t)i;
@@ -435,21 +431,30 @@ static uint32_t g_slab_hist[K_MAX_SLABS];
 
 // Sort one slab (or whole bucket) of (key, pos) pairs and stream the
 // corresponding BWT bytes directly to `fp` (no in-memory output buffer).
-// Two cleanly separated passes:
-//   1. std::sort by 64-bit key only (pure integer compare, no inp loads).
-//   2. Linear scan for runs of equal keys; sort each run by cmp_cyclic
-//      with position as the final tie-break (no key compare in this
-//      pass, since every element in the run shares the same key).
+// The comparator chains key < cmp_cyclic < position so equal keys resolve
+// via full cyclic suffix comparison, with any remaining true-tie group
+// broken by ascending position (same ordering the dumb path uses).
 // *out_idx tracks bytes written so we can record pi when pos==0 lands.
+//
+// A 2-stage variant (sort by key only, then sort each tied run via
+// cmp_cyclic) was measured to issue slightly MORE cmp_cyclic calls,
+// because libstdc++'s introsort uses insertion sort for small ranges
+// (~<=16 elements), which costs O(g^2/4) -- fewer than g*log(g) for
+// small g. The composite comparator inherits that benefit.
 static void sort_and_emit(KP* kp, size_t cnt,
                           const uint8_t* inp, size_t n,
                           FILE* fp, size_t* out_idx, uint32_t* pi) {
     g_stats.sort_and_emit_calls++;
-
-    std::sort(kp, kp + cnt, [](const KP& a, const KP& b) {
-        return a.k < b.k;
+    std::sort(kp, kp + cnt, [inp, n](const KP& a, const KP& b) {
+        if (a.k != b.k) return a.k < b.k;
+        int c = cmp_cyclic(inp, n, a.p, b.p);
+        if (c != 0) return c < 0;
+        return a.p < b.p;
     });
 
+    // Diagnostic: count tied-key runs in the sorted slab. Pure linear
+    // scan, no further comparisons; surfaces how much of cmp_cyclic's
+    // budget is spent on long equal-key clusters.
     for (size_t i = 0; i < cnt; ) {
         size_t j = i + 1;
         while (j < cnt && kp[j].k == kp[i].k) j++;
@@ -458,11 +463,6 @@ static void sort_and_emit(KP* kp, size_t cnt,
             g_stats.tied_groups++;
             g_stats.tied_items += g;
             if (g > g_stats.tied_group_max) g_stats.tied_group_max = g;
-            std::sort(kp + i, kp + j, [inp, n](const KP& a, const KP& b) {
-                int c = cmp_cyclic(inp, n, a.p, b.p);
-                if (c != 0) return c < 0;
-                return a.p < b.p;
-            });
         }
         i = j;
     }
@@ -498,12 +498,10 @@ static void process_bucket(const uint64_t* bk, const uint32_t* bp, size_t m,
         return;
     }
 
-    // Partition by the full 64-bit key. w = floor(~0ULL / S) fits in
-    // uint64 and S*w <= ~0ULL, so non-last slab boundaries don't
-    // overflow; the last slab (s = S-1) is extended to ~0ULL inclusive
-    // to cover the residual gap (~0ULL - S*w + 1 elements wide).
+    const uint64_t K_CODE_RANGE = 1ULL << K_CODE_BITS;
+    const uint64_t K_CODE_MASK  = K_CODE_RANGE - 1;
     size_t S = (m + K_SLAB_TARGET - 1) / K_SLAB_TARGET;
-    uint64_t w = ~0ULL / S;
+    uint64_t w = K_CODE_RANGE / S;
     if (w == 0) w = 1;
 
     // ---- pre-histogram or whole-bucket fall-back ----------------------
@@ -511,7 +509,8 @@ static void process_bucket(const uint64_t* bk, const uint32_t* bp, size_t m,
     if (!fallback) {
         memset(g_slab_hist, 0, S * sizeof(uint32_t));
         for (size_t i = 0; i < m; i++) {
-            size_t s = (size_t)(bk[i] / w);
+            uint64_t k_low = bk[i] & K_CODE_MASK;
+            size_t s = (size_t)(k_low / w);
             if (s >= S) s = S - 1;
             g_slab_hist[s]++;
         }
@@ -531,13 +530,14 @@ static void process_bucket(const uint64_t* bk, const uint32_t* bp, size_t m,
     // ---- slab partition with static buffer ----------------------------
     for (size_t s = 0; s < S; s++) {
         g_stats.slab_passes++;
-        uint64_t slab_lo = s * w;
-        uint64_t slab_hi = (s == S - 1) ? ~0ULL : (s + 1) * w - 1;
+        uint64_t slab_lo48 = s * w;
+        uint64_t slab_hi48 = (s == S - 1) ? K_CODE_RANGE : (s + 1) * w;
         size_t cnt = 0;
         for (size_t i = 0; i < m; i++) {
-            uint64_t k = bk[i];
-            uint32_t p = bp[i];
-            int take = (int)((k >= slab_lo) & (k <= slab_hi));
+            uint64_t k     = bk[i];
+            uint32_t p     = bp[i];
+            uint64_t k_low = k & K_CODE_MASK;
+            int take = (int)((k_low >= slab_lo48) & (k_low < slab_hi48));
             g_slab[cnt].k = k;
             g_slab[cnt].p = p;
             cnt += (size_t)take;
@@ -580,7 +580,7 @@ static void rcbwt(const uint8_t* inp, size_t n, FILE* fp) {
 
     uint64_t* keys_perm = (uint64_t*)malloc(n * sizeof(uint64_t));
     uint32_t* pos_perm  = (uint32_t*)malloc(n * sizeof(uint32_t));
-    distribute(inp, keys, n, keys_perm, pos_perm);
+    distribute(keys, n, keys_perm, pos_perm);
     free(keys);
 
     size_t out_idx = 0;
