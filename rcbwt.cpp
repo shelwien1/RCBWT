@@ -25,6 +25,7 @@
 // previous raw-prefix+48-bit-code layout exposed.
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -289,6 +290,27 @@ static inline uint32_t cum_lookup(uint8_t q, uint8_t p, uint32_t c) {
     return g_cum2[(((uint32_t)q << 8) | p) * CNUM1 + c];
 }
 
+// Self-entropy of inp under the order-2 model already built in g_cum2.
+// Each linear position i in [2, n) contributes 32 - log2(r) bits where
+// r = cum_lookup(q,p,c+1) - cum_lookup(q,p,c) is the modular probability
+// of inp[i] given (inp[i-2], inp[i-1]) on the 2^32 fixed-point grid.
+// Returns total bits / (n-2). Lower bound for any order-2 compressor
+// using this exact model.
+static double compute_order2_bpb(const uint8_t* inp, size_t n) {
+    if (n <= 2) return 0.0;
+    double total_bits = 0.0;
+    for (size_t i = 2; i < n; i++) {
+        uint8_t q = inp[i - 2];
+        uint8_t p = inp[i - 1];
+        uint8_t c = inp[i];
+        uint32_t lo = cum_lookup(q, p, c);
+        uint32_t hi = cum_lookup(q, p, (uint32_t)c + 1);
+        uint32_t r  = hi - lo;          // modular; always >= 1 (floor)
+        total_bits += 32.0 - std::log2((double)r);
+    }
+    return total_bits / (double)(n - 2);
+}
+
 // Bit layout of the 64-bit composite sort key: the top K_TOP_BITS feed
 // the MSD radix; the bottom K_CODE_BITS feed the slab partition. With
 // keys now being full AC encodings, "top" carries the order-0+order-1
@@ -549,6 +571,8 @@ static void rcbwt(const uint8_t* inp, size_t n, FILE* fp) {
     }
 
     build_models(inp, n);
+    printf("[input] order-2 self-entropy: %.4f bpb\n",
+           compute_order2_bpb(inp, n));
     build_prefix_intervals();
 
     uint64_t* keys = (uint64_t*)malloc(n * sizeof(uint64_t));
