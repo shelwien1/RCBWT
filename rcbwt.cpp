@@ -3,26 +3,27 @@
 //
 // Output format: [ n bytes BWT ][ 4 bytes LE primary index pi ]
 //
-// Each composite key is the full 64-bit arithmetic-code value of the
-// entire cyclic rotation starting at j, encoded as
+// Each cyclic rotation gets a 64-bit sort key = the order-2 AC code of
+// its cyclic tail starting at inp[(j+2) mod n], built by the two-pass
+// refine recurrence (pass 1 write-only, pass 2 TRACK=true with
+// early-exit on first matching key). build_keys() leaves keys as raw
+// 64-bit codes; cross-prefix lex order is restored by the MSD radix in
+// distribute(), which bucketizes on the raw 2-byte prefix
+// (inp[j], inp[(j+1)%n]).
 //
-//     AC(order-0 of inp[j])
-//       . AC(order-1 of inp[(j+1)%n] | inp[j])
-//         . AC(order-2 of inp[(j+2)%n], inp[(j+3)%n], ... cyclically)
+// Within each bucket all positions share (q,p) and the order-2 AC tail
+// codes preserve the lex order of the remaining cyclic rotation by
+// monotonicity. process_bucket slab-partitions over the full 64-bit
+// key value. sort_and_emit runs two cleanly separated passes per
+// slab: pass 1 sorts by key only (pure integer compare, no inp
+// loads); pass 2 walks runs of equal keys and sorts each by
+// cmp_cyclic + position only -- no redundant key compares in the hot
+// tie-break loop.
 //
-// build_keys() runs the two-pass refine recurrence (pass 1 write-only,
-// pass 2 with TRACK = early-exit on first matching key) to fill keys[]
-// with the 64-bit order-2 tail codes, then a final O(N) loop scales
-// each tail into its 2-byte prefix interval — precomputed in
-// g_prefix_lo / g_prefix_r for every (q,p) pair from the order-0 and
-// order-1 cum tables.
-//
-// The MSD radix in distribute() now reads the top 16 bits of these
-// fully entropy-coded keys, so bucket sizes track AC probabilities of
-// the 2-byte prefix instead of raw (q,p) frequencies — buckets are
-// entropy-balanced and the within-bucket tail bits carry roughly 12
-// bytes of distinguishing context instead of the ~6 bytes the
-// previous raw-prefix+48-bit-code layout exposed.
+// The order-0 and order-1 cum tables (g_cum0, g_cum1) and the
+// per-(q,p) prefix interval table (g_prefix_lo/r) are still built and
+// retained for instrumentation / future variants but are no longer
+// used to wrap keys.
 
 #include <algorithm>
 #include <cmath>
@@ -434,30 +435,21 @@ static uint32_t g_slab_hist[K_MAX_SLABS];
 
 // Sort one slab (or whole bucket) of (key, pos) pairs and stream the
 // corresponding BWT bytes directly to `fp` (no in-memory output buffer).
-// The comparator chains key < cmp_cyclic < position so equal keys resolve
-// via full cyclic suffix comparison, with any remaining true-tie group
-// broken by ascending position (same ordering the dumb path uses).
+// Two cleanly separated passes:
+//   1. std::sort by 64-bit key only (pure integer compare, no inp loads).
+//   2. Linear scan for runs of equal keys; sort each run by cmp_cyclic
+//      with position as the final tie-break (no key compare in this
+//      pass, since every element in the run shares the same key).
 // *out_idx tracks bytes written so we can record pi when pos==0 lands.
-//
-// A 2-stage variant (sort by key only, then sort each tied run via
-// cmp_cyclic) was measured to issue slightly MORE cmp_cyclic calls,
-// because libstdc++'s introsort uses insertion sort for small ranges
-// (~<=16 elements), which costs O(g^2/4) -- fewer than g*log(g) for
-// small g. The composite comparator inherits that benefit.
 static void sort_and_emit(KP* kp, size_t cnt,
                           const uint8_t* inp, size_t n,
                           FILE* fp, size_t* out_idx, uint32_t* pi) {
     g_stats.sort_and_emit_calls++;
-    std::sort(kp, kp + cnt, [inp, n](const KP& a, const KP& b) {
-        if (a.k != b.k) return a.k < b.k;
-        int c = cmp_cyclic(inp, n, a.p, b.p);
-        if (c != 0) return c < 0;
-        return a.p < b.p;
+
+    std::sort(kp, kp + cnt, [](const KP& a, const KP& b) {
+        return a.k < b.k;
     });
 
-    // Diagnostic: count tied-key runs in the sorted slab. Pure linear
-    // scan, no further comparisons; surfaces how much of cmp_cyclic's
-    // budget is spent on long equal-key clusters.
     for (size_t i = 0; i < cnt; ) {
         size_t j = i + 1;
         while (j < cnt && kp[j].k == kp[i].k) j++;
@@ -466,6 +458,11 @@ static void sort_and_emit(KP* kp, size_t cnt,
             g_stats.tied_groups++;
             g_stats.tied_items += g;
             if (g > g_stats.tied_group_max) g_stats.tied_group_max = g;
+            std::sort(kp + i, kp + j, [inp, n](const KP& a, const KP& b) {
+                int c = cmp_cyclic(inp, n, a.p, b.p);
+                if (c != 0) return c < 0;
+                return a.p < b.p;
+            });
         }
         i = j;
     }
