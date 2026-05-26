@@ -367,12 +367,9 @@ static bool refine_pass(const uint8_t* inp, size_t n,
 //      holds the 64-bit order-2 AC code of the cyclic tail starting
 //      at inp[(j+2) mod n].
 //
-//   2. (Disabled experiment) Wrap: scale each tail into its 2-byte
-//      prefix interval. Disabling keeps keys as raw 64-bit tail
-//      codes; distribute() restores cross-prefix order by bucketing
-//      on raw (q,p) bytes, and within a bucket all keys share (q,p)
-//      so the tail codes themselves preserve lex order of the
-//      remaining cyclic rotation.
+//   2. Wrap: scale each tail into its 2-byte prefix interval using
+//      the precomputed g_prefix_lo / g_prefix_r tables, turning each
+//      key into the full AC encoding of the entire cyclic rotation.
 static void build_keys(const uint8_t* inp, size_t n, uint64_t* keys) {
     if (n == 0) return;
     if (n == 1) { keys[0] = 0; return; }
@@ -383,28 +380,25 @@ static void build_keys(const uint8_t* inp, size_t n, uint64_t* keys) {
         if (refine_pass<true>(inp, n, keys, n - 1)) break;
     }
 
-    // for (size_t j = 0; j < n; j++) {
-    //     size_t jp1 = (j + 1 < n) ? j + 1 : 0;
-    //     size_t idx = (size_t)inp[j] * CNUM + inp[jp1];
-    //     keys[j] = g_prefix_lo[idx]
-    //             + mul_u64_u64_hi(keys[j], g_prefix_r[idx]);
-    // }
+    for (size_t j = 0; j < n; j++) {
+        size_t jp1 = (j + 1 < n) ? j + 1 : 0;
+        size_t idx = (size_t)inp[j] * CNUM + inp[jp1];
+        keys[j] = g_prefix_lo[idx]
+                + mul_u64_u64_hi(keys[j], g_prefix_r[idx]);
+    }
 }
 
-// ---- distribution pass (raw 2-byte prefix radix) ------------------------
+// ---- distribution pass (top K_TOP_BITS bits) ----------------------------
 
-// One-pass MSD radix using the raw 2-byte prefix (inp[i], inp[(i+1)%n])
-// as the bucket index. With the prefix-wrap loop in build_keys disabled,
-// the keys[] are full 64-bit order-2 tail codes; the bucket index has to
-// come from inp[] directly to restore cross-prefix lex order. Within each
-// bucket all positions share (q,p) and the 64-bit tail codes carry the
-// order of the remaining cyclic rotation.
-static void distribute(const uint8_t* inp, const uint64_t* keys, size_t n,
+// One-pass MSD radix on the top K_TOP_BITS of each key. Builds the
+// per-bucket prefix-sum g_bbase[N_BUCKETS+1] and scatters (key, pos)
+// pairs into keys_perm[]/pos_perm[] so bucket b occupies the range
+// [g_bbase[b], g_bbase[b+1]).
+static void distribute(const uint64_t* keys, size_t n,
                        uint64_t* keys_perm, uint32_t* pos_perm) {
     memset(g_bbase, 0, sizeof(g_bbase));
     for (size_t i = 0; i < n; i++) {
-        size_t ip1 = (i + 1 < n) ? i + 1 : 0;
-        uint32_t b = ((uint32_t)inp[i] << 8) | inp[ip1];
+        uint32_t b = (uint32_t)(keys[i] >> K_CODE_BITS);
         g_bbase[b + 1]++;
     }
     for (int b = 1; b <= N_BUCKETS; b++) {
@@ -412,8 +406,7 @@ static void distribute(const uint8_t* inp, const uint64_t* keys, size_t n,
     }
     memcpy(g_cursor, g_bbase, sizeof(g_cursor));
     for (size_t i = 0; i < n; i++) {
-        size_t ip1 = (i + 1 < n) ? i + 1 : 0;
-        uint32_t b = ((uint32_t)inp[i] << 8) | inp[ip1];
+        uint32_t b = (uint32_t)(keys[i] >> K_CODE_BITS);
         uint32_t dst = g_cursor[b]++;
         keys_perm[dst] = keys[i];
         pos_perm[dst] = (uint32_t)i;
@@ -505,14 +498,10 @@ static void process_bucket(const uint64_t* bk, const uint32_t* bp, size_t m,
         return;
     }
 
-    // Partition by the top K_CODE_BITS (= 48) of each 64-bit key. The
-    // full key is the AC tail code now (no separate prefix portion), so
-    // any monotonic projection that preserves cross-slab order works;
-    // shifting off the bottom K_TOP_BITS = 16 keeps the most-significant
-    // bits where most discrimination lives.
-    const uint64_t K_PART_RANGE = 1ULL << K_CODE_BITS;
+    const uint64_t K_CODE_RANGE = 1ULL << K_CODE_BITS;
+    const uint64_t K_CODE_MASK  = K_CODE_RANGE - 1;
     size_t S = (m + K_SLAB_TARGET - 1) / K_SLAB_TARGET;
-    uint64_t w = K_PART_RANGE / S;
+    uint64_t w = K_CODE_RANGE / S;
     if (w == 0) w = 1;
 
     // ---- pre-histogram or whole-bucket fall-back ----------------------
@@ -520,8 +509,8 @@ static void process_bucket(const uint64_t* bk, const uint32_t* bp, size_t m,
     if (!fallback) {
         memset(g_slab_hist, 0, S * sizeof(uint32_t));
         for (size_t i = 0; i < m; i++) {
-            uint64_t k_part = bk[i] >> K_TOP_BITS;
-            size_t s = (size_t)(k_part / w);
+            uint64_t k_low = bk[i] & K_CODE_MASK;
+            size_t s = (size_t)(k_low / w);
             if (s >= S) s = S - 1;
             g_slab_hist[s]++;
         }
@@ -542,13 +531,13 @@ static void process_bucket(const uint64_t* bk, const uint32_t* bp, size_t m,
     for (size_t s = 0; s < S; s++) {
         g_stats.slab_passes++;
         uint64_t slab_lo48 = s * w;
-        uint64_t slab_hi48 = (s == S - 1) ? K_PART_RANGE : (s + 1) * w;
+        uint64_t slab_hi48 = (s == S - 1) ? K_CODE_RANGE : (s + 1) * w;
         size_t cnt = 0;
         for (size_t i = 0; i < m; i++) {
-            uint64_t k      = bk[i];
-            uint32_t p      = bp[i];
-            uint64_t k_part = k >> K_TOP_BITS;
-            int take = (int)((k_part >= slab_lo48) & (k_part < slab_hi48));
+            uint64_t k     = bk[i];
+            uint32_t p     = bp[i];
+            uint64_t k_low = k & K_CODE_MASK;
+            int take = (int)((k_low >= slab_lo48) & (k_low < slab_hi48));
             g_slab[cnt].k = k;
             g_slab[cnt].p = p;
             cnt += (size_t)take;
@@ -591,7 +580,7 @@ static void rcbwt(const uint8_t* inp, size_t n, FILE* fp) {
 
     uint64_t* keys_perm = (uint64_t*)malloc(n * sizeof(uint64_t));
     uint32_t* pos_perm  = (uint32_t*)malloc(n * sizeof(uint32_t));
-    distribute(inp, keys, n, keys_perm, pos_perm);
+    distribute(keys, n, keys_perm, pos_perm);
     free(keys);
 
     size_t out_idx = 0;
