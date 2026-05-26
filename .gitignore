@@ -1,4 +1,6 @@
 rcbwt
+rcbwt_sparse
+rcbwt1
 book1out
 book1bwt
 *.o
