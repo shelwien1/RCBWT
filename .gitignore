@@ -1,4 +1,5 @@
 rcbwt
+rcbwt2
 rcbwt_sparse
 rcbwt1
 book1out
@@ -6,3 +7,6 @@ book1bwt
 *.o
 BWT
 unBWT
+enwik8
+enwik8.zip
+/1
