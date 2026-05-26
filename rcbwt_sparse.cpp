@@ -32,15 +32,12 @@ static const size_t K_MAX_SLABS     = 4096;                 // pre-histogram cap
 // All compile-time-sized tables live as static globals — no per-call malloc.
 // The fast driver runs at most once per process, so these are not reset between
 // calls; the only resets are explicit memset() / overwrite at the use sites.
-//
-// g_cum2 is a dense order-2 cumulative-frequency table: one CNUM1-entry row
-// per (q,p) context pair, indexed directly by `ctx * CNUM1 + c`. This costs
-// ~64 MB of BSS but lets cum_lookup be one array access with no fallback
-// branch. Unobserved (q,p) contexts get a uniform row from normalize_row
-// (its zero-count floor produces equal intervals for every symbol).
-static uint32_t g_cum2     [N_BUCKETS * CNUM1];        // dense order-2 cum
+static uint32_t g_cum1     [CNUM * CNUM1];             // order-1 cum table
+static uint32_t g_ctx2_off [N_BUCKETS];                // order-2 row offsets
 static uint32_t g_bbase    [N_BUCKETS + 1];            // distribution prefix sum
 static uint32_t g_cursor   [N_BUCKETS];                // scatter cursors
+static uint32_t g_cnt1     [CNUM * CNUM];              // raw order-1 counts
+static uint8_t  g_ctx_seen [N_BUCKETS];                // non-empty (q,p) flag
 
 // ---- stats counters -----------------------------------------------------
 
@@ -165,20 +162,24 @@ static int read_bwt_file(const char* path, size_t n,
     return 0;
 }
 
-// ---- order-2 model -----------------------------------------------------
+// ---- order-1 / order-2 model -------------------------------------------
 
 // Cumulative table convention: cum[0..CNUM] stored in CNUM1 uint32 entries.
 // cum[0] = 0; cum[c+1] = sum of normalised counts up to c (out of 2^32);
 // cum[CNUM] = 2^32 stored as 0 (32-bit wrap). r = cum[c+1] - cum[c] is then
 // computed modularly and gives the right value even when c = CNUM-1.
 
+// Order-2 row pool — only n-dependent allocation in the model. Each
+// non-empty (q,p) context owns CNUM1 entries; offset 0 is a reserved
+// sentinel meaning "context never observed, fall back to cum1".
+static uint32_t* g_pool      = NULL;
+static size_t    g_pool_cap  = 0;
+
 // Convert one CNUM-entry row from raw counts to a cumulative-probability
 // table (in-place, written to row[0..CNUM]). Zero counts get a 1-symbol
 // floor so every symbol has a non-zero interval; the resulting row[c+1]
 // values are scaled to the 2^32 fixed-point grid, with row[CNUM] = 2^32
-// stored as 0 (wraps in uint32). An all-zero input row therefore yields a
-// uniform distribution — that is the implicit fallback for (q,p) contexts
-// that were never observed during the model build.
+// stored as 0 (wraps in uint32).
 static void normalize_row(uint32_t* row) {
     uint32_t flo[CNUM];
     uint64_t total = 0;
@@ -195,28 +196,73 @@ static void normalize_row(uint32_t* row) {
     row[0] = 0;
 }
 
-// Build the dense order-2 model into g_cum2. Every (q,p) row is normalised
-// — observed contexts use their actual symbol counts, while never-observed
-// contexts (all-zero counts) fall through to the floor-of-1 path and end
-// up uniform. Counting uses linear positions only (i >= 2); the cyclic
-// wrap that build_code does at the buffer boundary visits two un-counted
-// triples per cycle, and those simply pick up the uniform-row default.
+// Build the static order-1 and order-2 statistical models used by the
+// arithmetic-coded key tail. The order-1 table g_cum1[p][·] is dense
+// (CNUM rows always present). The order-2 table is sparse: g_ctx2_off[ctx]
+// points into g_pool for non-empty contexts only, and lookups fall back
+// to cum1 when a (q,p) context was never observed. Both tables are built
+// from linear positions of inp (no cyclic wrap during counting — model
+// affects key density, not correctness).
 static void build_models(const uint8_t* inp, size_t n) {
-    memset(g_cum2, 0, sizeof(g_cum2));
+    // ---- order-1 model ----
+    memset(g_cnt1, 0, sizeof(g_cnt1));
+    for (size_t i = 1; i < n; i++) {
+        g_cnt1[(size_t)inp[i - 1] * CNUM + inp[i]]++;
+    }
+    for (int p = 0; p < CNUM; p++) {
+        for (int c = 0; c < CNUM; c++) {
+            g_cum1[p * CNUM1 + c] = g_cnt1[p * CNUM + c];
+        }
+        g_cum1[p * CNUM1 + CNUM] = 0;
+        normalize_row(&g_cum1[p * CNUM1]);
+    }
+
+    // ---- order-2 model ----
+    memset(g_ctx2_off, 0, sizeof(g_ctx2_off));
+    memset(g_ctx_seen, 0, sizeof(g_ctx_seen));
+
+    size_t n_ctx = 0;
     for (size_t i = 2; i < n; i++) {
         uint32_t ctx = ((uint32_t)inp[i - 2] << 8) | inp[i - 1];
-        g_cum2[ctx * CNUM1 + inp[i]]++;
+        if (!g_ctx_seen[ctx]) { g_ctx_seen[ctx] = 1; n_ctx++; }
     }
+
+    g_pool_cap = (n_ctx + 1) * CNUM1;       // offset 0 reserved as sentinel
+    free(g_pool);
+    g_pool = (uint32_t*)calloc(g_pool_cap, sizeof(uint32_t));
+
+    size_t next_off = CNUM1;
     for (int ctx = 0; ctx < N_BUCKETS; ctx++) {
-        normalize_row(&g_cum2[ctx * CNUM1]);
+        if (g_ctx_seen[ctx]) {
+            g_ctx2_off[ctx] = (uint32_t)next_off;
+            next_off += CNUM1;
+        }
+    }
+
+    // Accumulate raw counts into the assigned row slots.
+    for (size_t i = 2; i < n; i++) {
+        uint32_t ctx = ((uint32_t)inp[i - 2] << 8) | inp[i - 1];
+        uint32_t off = g_ctx2_off[ctx];
+        g_pool[off + inp[i]]++;
+    }
+
+    // Normalise each populated row.
+    for (int ctx = 0; ctx < N_BUCKETS; ctx++) {
+        uint32_t off = g_ctx2_off[ctx];
+        if (!off) continue;
+        normalize_row(&g_pool[off]);
     }
 }
 
-// One direct array access — no fallback branch, no offset indirection.
-// c may be CNUM, in which case row[CNUM] = 0 (the wrapped 2^32) lets the
-// caller compute (hi - lo) modularly to get the correct symbol range.
+// Look up cum[(q,p)][c] in the order-2 model, falling back to cum1[p][c]
+// when the (q,p) context was never observed (g_ctx2_off[ctx] == 0).
+// c may be CNUM, in which case row[CNUM] = 0 (the wrapped 2^32) makes
+// the subsequent (hi - lo) subtraction yield the correct symbol range
+// modularly.
 static inline uint32_t cum_lookup(uint8_t q, uint8_t p, uint32_t c) {
-    return g_cum2[(((uint32_t)q << 8) | p) * CNUM1 + c];
+    uint32_t off = g_ctx2_off[((uint32_t)q << 8) | p];
+    if (off) return g_pool[off + c];
+    return g_cum1[(uint32_t)p * CNUM1 + c];
 }
 
 // Code-build precision floor: stop the arithmetic-code loop once span
@@ -447,6 +493,8 @@ static void rcbwt(const uint8_t* inp, size_t n, FILE* fp) {
 
     free(keys_perm);
     free(pos_perm);
+    free(g_pool);
+    g_pool = NULL;
 }
 
 // ---- reference (std::sort on cyclic rotations) --------------------------
@@ -563,21 +611,24 @@ static void print_algo_stats(const char* tag) {
 }
 
 // Sum and report dynamic and static memory in units of the input size n.
-// The dense g_cum2 dominates the fixed-globals total (~64 MB BSS).
-static void print_memory_stats(size_t n,
+// `pool_bytes` lets the caller report g_pool's final size (it varies with
+// the number of non-empty order-2 contexts in the input).
+static void print_memory_stats(size_t n, size_t pool_bytes,
                                size_t fast_bwt_readback_bytes,
                                int with_dumb) {
     auto pct = [n](size_t bytes) -> double {
         return n ? (double)bytes / n : 0.0;
     };
-    size_t fixed = sizeof(g_cum2) + sizeof(g_bbase) + sizeof(g_cursor)
-                 + sizeof(g_slab) + sizeof(g_slab_hist);
+    size_t fixed = sizeof(g_cum1) + sizeof(g_ctx2_off) + sizeof(g_bbase)
+                 + sizeof(g_cursor) + sizeof(g_cnt1)   + sizeof(g_ctx_seen)
+                 + sizeof(g_slab)  + sizeof(g_slab_hist);
 
     printf("Memory for n=%zu bytes:\n", n);
     printf("  inp           = %5.2fn  (%zu B)\n", pct(n),       n);
     printf("  keys          = %5.2fn  (%zu B)\n", pct(8 * n),   8 * n);
     printf("  keys_perm     = %5.2fn  (%zu B)\n", pct(8 * n),   8 * n);
     printf("  pos_perm      = %5.2fn  (%zu B)\n", pct(4 * n),   4 * n);
+    printf("  g_pool (ord-2)= %5.3fn  (%zu B)\n", pct(pool_bytes), pool_bytes);
     if (with_dumb) {
         printf("  bwt_fast read = %5.2fn  (%zu B, verification only)\n",
                pct(fast_bwt_readback_bytes), fast_bwt_readback_bytes);
@@ -586,10 +637,10 @@ static void print_memory_stats(size_t n,
         printf("  chk (inverse) = %5.2fn  (%zu B)\n", pct(n),     n);
         printf("  rank (inverse)= %5.2fn  (%zu B)\n", pct(4 * n), 4 * n);
     }
-    printf("  static globals= %5.2fn  (%zu B fixed: cum2+bbase+cursor+slab+slab_hist)\n",
+    printf("  static globals= %5.3fn  (%zu B fixed: cum1+ctx2_off+bbase+cursor+cnt1+ctx_seen+slab+slab_hist)\n",
            pct(fixed), fixed);
 
-    size_t dyn_fast = n + 8*n + 8*n + 4*n;
+    size_t dyn_fast = n + 8*n + 8*n + 4*n + pool_bytes;          // no bwt_out
     size_t dyn_dumb = with_dumb
         ? (fast_bwt_readback_bytes + n + 4*n + n + 4*n)
         : 0;
@@ -623,6 +674,7 @@ int main(int argc, char** argv) {
     rcbwt(inp, n, fp_fast);
     fclose(fp_fast);
     print_algo_stats("rcbwt");
+    size_t pool_bytes = g_pool_cap * sizeof(uint32_t);
 
     int rc = 0;
     if (argc == 4) {
@@ -660,7 +712,7 @@ int main(int argc, char** argv) {
         free(bwt_ref);
     }
 
-    print_memory_stats(n, argc == 4 ? n : 0, argc == 4);
+    print_memory_stats(n, pool_bytes, argc == 4 ? n : 0, argc == 4);
 
     free(inp);
     return rc;
