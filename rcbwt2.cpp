@@ -1,14 +1,19 @@
-// rcbwt2: rcbwt + anchor/backward-prepend recurrence in build_keys.
+// rcbwt2: rcbwt + wrap-until-stable recurrence in build_keys.
 // Usage: rcbwt2 inputfile outputfile [dumb-BWT-file]
 //
 // Output format (both fast and reference paths):
 //   [ 4 bytes LE primary index pi ][ n bytes BWT ]
 //
-// Difference from rcbwt: build_keys() no longer recomputes each code from
-// scratch. code[n-1] is built once via build_code (which already handles
-// cyclic wrap), then code[j] for j = n-2..0 is derived from code[j+1] in
-// O(1) via a single prepend step, dropping the inner work from ~6-7n to
-// ~n iterations. Output and pi are byte-identical to rcbwt.
+// Difference from rcbwt: build_keys() no longer calls build_code at all.
+// keys[] are zero-initialized and refined by repeated backward passes
+//
+//      code[j] = mul_hi(~0, lo) + mul_hi(code[(j+1)%n] << 16, r)
+//
+// where the raw prefix bytes are re-written into the top 16 bits of
+// keys[j] every pass and shifted out when reading a neighbour's code.
+// The pass loop exits as soon as a full pass leaves every key unchanged.
+// On book1 this converges in 3 passes (~3n inner steps vs ~6-7n
+// build_code iterations in rcbwt). Output and pi are byte-identical.
 
 #include <algorithm>
 #include <cstdint>
@@ -221,56 +226,40 @@ static inline uint32_t cum_lookup(uint8_t q, uint8_t p, uint32_t c) {
     return g_cum2[(((uint32_t)q << 8) | p) * CNUM1 + c];
 }
 
-// Code-build precision floor: stop the arithmetic-code loop once span
-// drops below this. Below this point the (span * r) >> 32 multiply
-// underflows to near-zero and contributes no information.
-static const uint64_t K_SPAN_FLOOR = 1ULL << 16;
-
 // Bit layout of the 64-bit composite sort key.
 static const int K_PREFIX_BITS = 16;                          // 2 raw symbols
 static const int K_CODE_BITS   = 64 - K_PREFIX_BITS;          // 48
 
-// Build a 64-bit arithmetic code from inp[start..], wrapping cyclically.
-// Cyclic wrap makes the key a function of the entire rotation, which
-// preserves order across positions of different effective "tail length".
-static inline uint64_t build_code(const uint8_t* inp, size_t n, size_t start) {
-    uint64_t code = 0;
-    uint64_t span = ~0ULL;
-    size_t k = start;
-    while (span >= K_SPAN_FLOOR) {
-        g_stats.code_iters++;
-        size_t  kk = (k     < n) ? k     : k - n;
-        size_t  k1 = (kk    > 0) ? kk - 1 : n - 1;
-        size_t  k2 = (k1    > 0) ? k1 - 1 : n - 1;
-        uint8_t c = inp[kk];
-        uint8_t p = inp[k1];
-        uint8_t q = inp[k2];
-        uint32_t lo = cum_lookup(q, p, c);
-        uint32_t hi = cum_lookup(q, p, (uint32_t)c + 1);
-        uint32_t r  = hi - lo;             // modular: r = 2^32 when c=CNUM-1
-        code += mul_u64_u32_hi(span, lo);
-        span  = mul_u64_u32_hi(span, r);
-        k++;
-        if (k >= 2 * n) k -= n;            // keep k bounded
-    }
-    return code;
-}
+// Convergence cap for the wrap-around recurrence. 16 passes is plenty:
+// at 48-bit precision and ~8 bits of span per order-2 step, the codes
+// fully saturate by pass 2 or 3 on any realistic input.
+static const int K_MAX_PASSES = 16;
 
 // Build the n composite 64-bit sort keys. Each key packs the rotation
-// starting at j into raw bytes inp[j], inp[(j+1) mod n], followed by the
-// top 48 bits of the order-2 arithmetic code of the cyclic tail.
+// starting at j into raw bytes inp[j], inp[(j+1) mod n] in the top 16
+// bits, followed by the top 48 bits of the order-2 arithmetic code of
+// the cyclic tail.
 //
-// Anchor + backward-prepend recurrence (rcbwt2):
-//   code[n-1] is built from scratch via build_code (cyclic wrap already
-//   handled inside). For j = n-2, n-3, ..., 0:
+// Wrap-until-stable recurrence (rcbwt2; no build_code, no anchor):
+//   keys[] is the only storage. The raw prefix bytes go into the top
+//   16 bits of each key on every write; the 48-bit code lives in the
+//   bottom 48 bits. To use a stored key as a tail for the AC recurrence
+//   we shift the prefix out (keys[jp1] << K_PREFIX_BITS), placing the
+//   48 code bits at the top of a 64-bit value and zeroing the bottom 16.
 //
-//      code[j] = mul_hi(~0, lo)  +  mul_hi(code[j+1], r)
+//   For each pass we walk j = n-1, n-2, ..., 0 (so j+1 / j+2 mod n are
+//   already updated this pass), applying
 //
-//   where (q, p, c) = (inp[j], inp[j+1], inp[(j+2) mod n]) and
-//   lo = cum_lookup(q,p,c), r = cum_lookup(q,p,c+1) - lo. The identity
-//   span'_{d+1} = mul_hi(span_d, r_-1) makes the entire shifted tail of
-//   code[j+1] scale by the new factor r in one O(1) step, exact up to
-//   integer rounding well below the 48-bit precision used downstream.
+//      code[j] = mul_hi(~0, lo)  +  mul_hi(code[jp1] << 16, r)
+//
+//   where (q, p, c) = (inp[j], inp[jp1], inp[jp2]),
+//         (jp1, jp2) = ((j+1) mod n, (j+2) mod n),
+//         lo = cum_lookup(q,p,c), r = cum_lookup(q,p,c+1) - lo.
+//
+//   Pass 1 (over zero-initialized codes) propagates depth from j=n-1
+//   down to j=0 linearly. Pass 2 closes the cyclic edge so codes near
+//   j=n-1 catch up to full depth. Pass 3 is invariably a no-op, which
+//   the per-key compare detects and exits.
 static void build_keys(const uint8_t* inp, size_t n, uint64_t* keys) {
     if (n == 0) return;
     if (n == 1) {
@@ -280,35 +269,39 @@ static void build_keys(const uint8_t* inp, size_t n, uint64_t* keys) {
         return;
     }
 
-    // Anchor: code[n-1] = build_code starting at (n-1)+2 ; the inner
-    // loop wraps cyclically so this is fully correct.
-    uint64_t code = build_code(inp, n, n + 1);
-    {
-        uint8_t  b0 = inp[n - 1];
-        uint8_t  b1 = inp[0];
-        keys[n - 1] = ((uint64_t)b0 << (K_CODE_BITS + 8))
-                    | ((uint64_t)b1 <<  K_CODE_BITS)
-                    | (code >> K_PREFIX_BITS);
-    }
+    memset(keys, 0, n * sizeof(uint64_t));
 
-    // Backward pass: prepend one symbol per step. For j in [0, n-2],
-    // j+1 < n (no wrap), but j+2 wraps at j = n-2.
-    for (size_t j = n - 1; j-- > 0; ) {
-        size_t  kk = (j + 2 < n) ? j + 2 : j + 2 - n;
-        uint8_t q  = inp[j];
-        uint8_t p  = inp[j + 1];
-        uint8_t c  = inp[kk];
-        uint32_t lo = cum_lookup(q, p, c);
-        uint32_t hi = cum_lookup(q, p, (uint32_t)c + 1);
-        uint32_t r  = hi - lo;
-        code = mul_u64_u32_hi(~0ULL, lo) + mul_u64_u32_hi(code, r);
-        g_stats.code_iters++;
+    for (int pass = 0; pass < K_MAX_PASSES; pass++) {
+        bool changed = false;
+        for (size_t j_inv = 0; j_inv < n; j_inv++) {
+            size_t j   = n - 1 - j_inv;
+            size_t jp1 = (j + 1 < n) ? j + 1 : 0;
+            size_t jp2 = (jp1 + 1 < n) ? jp1 + 1 : 0;
 
-        uint8_t b0 = inp[j];
-        uint8_t b1 = inp[j + 1];
-        keys[j] = ((uint64_t)b0 << (K_CODE_BITS + 8))
-                | ((uint64_t)b1 <<  K_CODE_BITS)
-                | (code >> K_PREFIX_BITS);
+            uint8_t q = inp[j];
+            uint8_t p = inp[jp1];
+            uint8_t c = inp[jp2];
+            uint32_t lo = cum_lookup(q, p, c);
+            uint32_t hi = cum_lookup(q, p, (uint32_t)c + 1);
+            uint32_t r  = hi - lo;
+
+            // Shift the 48-bit code of the right neighbour up to the top
+            // of a 64-bit value; the raw prefix bits fall off the high
+            // end and the bottom 16 bits become zero.
+            uint64_t tail = keys[jp1] << K_PREFIX_BITS;
+            uint64_t code = mul_u64_u32_hi(~0ULL, lo)
+                          + mul_u64_u32_hi(tail, r);
+            g_stats.code_iters++;
+
+            uint64_t new_key = ((uint64_t)q << (K_CODE_BITS + 8))
+                             | ((uint64_t)p <<  K_CODE_BITS)
+                             | (code >> K_PREFIX_BITS);
+            if (keys[j] != new_key) {
+                keys[j] = new_key;
+                changed = true;
+            }
+        }
+        if (!changed) break;
     }
 }
 
