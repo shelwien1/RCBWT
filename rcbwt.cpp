@@ -37,7 +37,8 @@
 static const int CNUM    = 256;
 static const int CNUM1   = CNUM + 1;                   // cum-table entries per row
 
-// MSD radix on the top K_TOP_BITS of the composite key.
+// MSD radix on the 16-bit raw 2-byte prefix of each cyclic rotation;
+// 65536 buckets, one per (inp[i], inp[(i+1) mod n]) pair.
 static const int K_TOP_BITS = 16;
 static const int N_BUCKETS  = 1 << K_TOP_BITS;         // 65536 = CNUM * CNUM
 
@@ -311,15 +312,10 @@ static double compute_order2_bpb(const uint8_t* inp, size_t n) {
     return total_bits / (double)(n - 2);
 }
 
-// Bit layout of the 64-bit composite sort key: the top K_TOP_BITS feed
-// the MSD radix; the bottom K_CODE_BITS feed the slab partition. With
-// keys now being full AC encodings, "top" carries the order-0+order-1
-// prefix and "bottom" carries the order-2 tail residue inside that
-// prefix interval.
-static const int K_CODE_BITS = 64 - K_TOP_BITS;          // 48
-
-// Safety cap for the refining pass — in practice convergence happens
-// inside the first call (early-exit a few prepends past n-1).
+// The sort key is the full 64-bit order-2 AC code of the cyclic tail.
+// The radix bucket index is computed separately from raw (inp[j],
+// inp[(j+1)%n]) in distribute(), so no bit of the key is consumed by
+// the bucket — within a bucket the slab partition gets all 64 bits.
 static const int K_MAX_REFINE_PASSES = 16;
 
 // Walk j = start_j..0 once, applying the order-2 prepend recurrence on
@@ -505,14 +501,12 @@ static void process_bucket(const uint64_t* bk, const uint32_t* bp, size_t m,
         return;
     }
 
-    // Partition by the top K_CODE_BITS (= 48) of each 64-bit key. The
-    // full key is the AC tail code now (no separate prefix portion), so
-    // any monotonic projection that preserves cross-slab order works;
-    // shifting off the bottom K_TOP_BITS = 16 keeps the most-significant
-    // bits where most discrimination lives.
-    const uint64_t K_PART_RANGE = 1ULL << K_CODE_BITS;
+    // Partition by the full 64-bit key. w = floor(~0ULL / S) fits in
+    // uint64 and S*w <= ~0ULL, so non-last slab boundaries don't
+    // overflow; the last slab (s = S-1) is extended to ~0ULL inclusive
+    // to cover the residual gap (~0ULL - S*w + 1 elements wide).
     size_t S = (m + K_SLAB_TARGET - 1) / K_SLAB_TARGET;
-    uint64_t w = K_PART_RANGE / S;
+    uint64_t w = ~0ULL / S;
     if (w == 0) w = 1;
 
     // ---- pre-histogram or whole-bucket fall-back ----------------------
@@ -520,8 +514,7 @@ static void process_bucket(const uint64_t* bk, const uint32_t* bp, size_t m,
     if (!fallback) {
         memset(g_slab_hist, 0, S * sizeof(uint32_t));
         for (size_t i = 0; i < m; i++) {
-            uint64_t k_part = bk[i] >> K_TOP_BITS;
-            size_t s = (size_t)(k_part / w);
+            size_t s = (size_t)(bk[i] / w);
             if (s >= S) s = S - 1;
             g_slab_hist[s]++;
         }
@@ -541,14 +534,13 @@ static void process_bucket(const uint64_t* bk, const uint32_t* bp, size_t m,
     // ---- slab partition with static buffer ----------------------------
     for (size_t s = 0; s < S; s++) {
         g_stats.slab_passes++;
-        uint64_t slab_lo48 = s * w;
-        uint64_t slab_hi48 = (s == S - 1) ? K_PART_RANGE : (s + 1) * w;
+        uint64_t slab_lo = s * w;
+        uint64_t slab_hi = (s == S - 1) ? ~0ULL : (s + 1) * w - 1;
         size_t cnt = 0;
         for (size_t i = 0; i < m; i++) {
-            uint64_t k      = bk[i];
-            uint32_t p      = bp[i];
-            uint64_t k_part = k >> K_TOP_BITS;
-            int take = (int)((k_part >= slab_lo48) & (k_part < slab_hi48));
+            uint64_t k = bk[i];
+            uint32_t p = bp[i];
+            int take = (int)((k >= slab_lo) & (k <= slab_hi));
             g_slab[cnt].k = k;
             g_slab[cnt].p = p;
             cnt += (size_t)take;
